@@ -1,0 +1,12 @@
+{% if message.role == "user" %}
+<div class="flex justify-end">
+  <p class="max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-sm bg-white px-4 py-2.5 text-neutral-950">{{ message.content }}</p>
+</div>
+{% elif message.role == "assistant" %}
+<div>
+  <p class="text-xs text-neutral-500">Agent</p>
+  <div class="mt-1 max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-tl-sm border border-neutral-800 bg-neutral-900 px-4 py-3 leading-relaxed text-neutral-100">{{ message.content }}</div>
+</div>
+{% else %}
+<p class="max-w-[85%] rounded-lg border border-red-900 bg-red-950/40 px-4 py-3 text-sm text-red-300">{{ message.content }}</p>
+{% endif %}

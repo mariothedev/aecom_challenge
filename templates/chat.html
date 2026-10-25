@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block content %}
+{% set suggestions = [
+  "Which findings are high severity?",
+  "Does the completion date in the contract agree with the programme?",
+  "Has an addendum changed anything that another document still contradicts?",
+] %}
+<div class="mx-auto flex min-h-screen max-w-3xl flex-col px-4 sm:px-6"
+     hx-on::after-request="document.getElementById('empty')?.remove()">
+  <header class="sticky top-0 z-10 flex items-center justify-between bg-neutral-950 py-4 text-sm text-neutral-500">
+    <a href="/review/1" class="hover:text-white">← Findings</a>
+    <form method="post" action="/chat">
+      <button class="hover:text-white">New conversation</button>
+    </form>
+  </header>
+
+  <main id="messages" class="flex-1 space-y-6 py-6">
+    {% for message in messages %}
+      {% include "chat_message.html" %}
+    {% else %}
+      <div id="empty" class="pt-16 text-center">
+        <h1 class="text-xl font-semibold text-white">Ask about the tender pack</h1>
+        <p class="mt-1 text-neutral-500">The agent reads the findings and the documents, and quotes its sources.</p>
+        <div class="mt-8 flex flex-col items-center gap-2">
+          {% for question in suggestions %}
+          <button hx-post="/chat/{{ conversation_id }}/messages" hx-vals='{{ {"content": question} | tojson }}'
+                  hx-target="#messages" hx-swap="beforeend"
+                  class="rounded-lg border border-neutral-800 px-4 py-2 text-sm text-neutral-300 hover:border-neutral-600 hover:text-white">
+            {{ question }}
+          </button>
+          {% endfor %}
+        </div>
+      </div>
+    {% endfor %}
+  </main>
+
+  <form hx-post="/chat/{{ conversation_id }}/messages" hx-target="#messages" hx-swap="beforeend"
+        hx-on::after-request="if (event.detail.successful) this.reset()"
+        class="sticky bottom-0 flex gap-2 bg-neutral-950 py-4">
+    <input name="content" required autocomplete="off" autofocus placeholder="Ask about the pack or its findings"
+           class="min-w-0 flex-1 rounded-lg border border-neutral-700 bg-neutral-900 px-4 py-2.5 text-white placeholder:text-neutral-500 focus:border-neutral-500 focus:outline-none">
+    <button id="send" class="rounded-lg bg-white px-5 py-2.5 font-medium text-neutral-950 hover:bg-neutral-200 disabled:opacity-50">Send</button>
+  </form>
+</div>
+<script>
+  // Keep the newest message in view, on page load and whenever htmx adds one.
+  document.addEventListener("htmx:load", () => window.scrollTo(0, document.body.scrollHeight));
+</script>
+{% endblock %}

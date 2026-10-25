@@ -1,0 +1,8 @@
+{% with message = {"role": "user", "content": content} %}{% include "chat_message.html" %}{% endwith %}
+
+{# As soon as this shows, it asks for the agent's reply and is replaced by it. #}
+<div hx-post="/chat/{{ conversation_id }}/reply" hx-trigger="load" hx-swap="outerHTML" hx-disabled-elt="#send"
+     class="flex items-center gap-3 text-sm text-neutral-400">
+  <span class="size-4 animate-spin rounded-full border-2 border-neutral-700 border-t-white"></span>
+  Agent is thinking…
+</div>

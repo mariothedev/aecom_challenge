@@ -14,7 +14,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import BaseModel, Field
 
@@ -904,6 +906,27 @@ def ensure_schema(conn):
             review_note TEXT
         )
     """)
+    conn.execute("CREATE SEQUENCE IF NOT EXISTS conversation_seq")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            conversation_id TEXT PRIMARY KEY
+                DEFAULT 'conversation_' || lpad(nextval('conversation_seq')::text, 6, '0'),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+    # Set when the conversation is about one finding, held next to it on the review page.
+    conn.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS finding_id TEXT")
+    conn.execute("CREATE SEQUENCE IF NOT EXISTS message_seq")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            message_id TEXT PRIMARY KEY
+                DEFAULT 'message_' || lpad(nextval('message_seq')::text, 6, '0'),
+            conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+            role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+            content TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
 
 
 def save_chunks(conn, filename, chunks, vectors):
@@ -1301,17 +1324,18 @@ def review(request: Request, number: int):
     with psycopg.connect(DATABASE_URL) as conn:
         ensure_schema(conn)
         findings = load_findings(conn)
+        if not 1 <= number <= len(findings):
+            statuses = [f["review_status"] for f in findings]
+            return templates.TemplateResponse(request, "done.html", {
+                "total": len(findings),
+                "confirmed": statuses.count("confirmed"),
+                "dismissed": statuses.count("dismissed"),
+                "unreviewed": statuses.count("unreviewed"),
+            })
+        finding = findings[number - 1]
+        conversation_id = finding_conversation(conn, finding["finding_id"])
+        messages = conversation_messages(conn, conversation_id)
 
-    if not 1 <= number <= len(findings):
-        statuses = [f["review_status"] for f in findings]
-        return templates.TemplateResponse(request, "done.html", {
-            "total": len(findings),
-            "confirmed": statuses.count("confirmed"),
-            "dismissed": statuses.count("dismissed"),
-            "unreviewed": statuses.count("unreviewed"),
-        })
-
-    finding = findings[number - 1]
     for statement in finding["statements"]:
         statement["section"] = section_of(statement)
         statement["table"] = table_header(statement)
@@ -1324,6 +1348,8 @@ def review(request: Request, number: int):
         "side_b": side_b,
         "values_a": side_values(side_a),
         "values_b": side_values(side_b),
+        "conversation_id": conversation_id,
+        "messages": [{"role": role, "content": content} for role, content in messages],
     })
 
 
@@ -1335,6 +1361,211 @@ def decide(number: int, finding_id: str = Form(...),
         conn.execute("UPDATE findings SET review_status = %s WHERE finding_id = %s",
                      (decision, finding_id))
     return RedirectResponse(f"/review/{number + 1}", status_code=303)
+
+
+# --------------------------------------------------------------------------
+# Chat: an agent that answers questions about the pack and its findings
+# --------------------------------------------------------------------------
+
+CHAT_PASSAGES = 6  # passages search_documents returns
+CHAT_STATEMENTS = 40  # statements search_statements returns
+MAX_AGENT_STEPS = 6  # rounds of tool calls before the agent must answer
+
+
+def describe_finding(finding):
+    """A finding and each of its statements, as the agent reads them."""
+    lines = [f"{finding['finding_id']} | {finding['severity']} | {finding['category']} | "
+             f"{finding['entity']} / {finding['attribute']} | review: {finding['review_status']}",
+             finding["explanation"]]
+    lines += [f"- {describe_for_judge(s)}" for s in finding["statements"]]
+    return "\n".join(lines)
+
+
+@tool
+def search_findings(text: str) -> str:
+    """List the contradictions found in the pack. Pass a word such as 'FZ-01', 'fire' or
+    'completion' to keep only the findings about it, or an empty string for all of them."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        findings = load_findings(conn)
+    lines = []
+    for finding in findings:
+        about = f"{finding['entity']} {finding['attribute']} {finding['explanation']}".lower()
+        if text.lower() in about:
+            lines.append(describe_finding(finding))
+    return "\n".join(lines) or "No findings match."
+
+
+@tool
+def search_statements(text: str) -> str:
+    """Find every statement about a thing, a property or a value, e.g. 'D-G02', 'fire' or
+    '1,200'. Use it to see where else a value is mentioned."""
+    pattern = f"%{text}%"
+    with psycopg.connect(DATABASE_URL) as conn:
+        statements = fetch_statements(
+            conn,
+            """ WHERE COALESCE(s.canonical_entity, s.entity) ILIKE %s
+                   OR COALESCE(s.canonical_attribute, s.attribute) ILIKE %s
+                   OR s.quote ILIKE %s OR s.normal_value ILIKE %s OR s.equipment_tag ILIKE %s
+                ORDER BY c.doc, c.page LIMIT %s""",
+            (pattern, pattern, pattern, pattern, pattern, CHAT_STATEMENTS),
+        )
+    lines = [f"{s['entity']} / {s['attribute']}: {describe_for_judge(s)}" for s in statements]
+    return "\n".join(lines) or "No statements match."
+
+
+@tool
+def search_documents(question: str) -> str:
+    """Find the passages of the tender pack that best answer a question, with their full
+    text. Use it to read what a document, drawing note or table says about a topic."""
+    vector = to_vector(embed([question])[0])
+    with psycopg.connect(DATABASE_URL) as conn:
+        rows = conn.execute(
+            """SELECT doc, page, section_parent, section_heading, section_content FROM chunks
+               ORDER BY embedding <=> %s::vector LIMIT %s""",
+            (vector, CHAT_PASSAGES),
+        ).fetchall()
+    passages = []
+    for doc, page, parent, heading, content in rows:
+        section = " > ".join(h for h in (parent, heading) if h)
+        passages.append(f"{doc} p{page}, {section}\n{content}")
+    return "\n\n".join(passages) or "The pack is empty."
+
+
+@tool
+def read_source(statement_id: str) -> str:
+    """Show the full section a statement was quoted from, e.g. for 'show me the full clause'."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        statements = fetch_statements(conn, " WHERE s.statement_id = %s", (statement_id,))
+    if not statements:
+        return f"There is no statement {statement_id}."
+    statement = statements[0]
+    return f"{statement['doc']} p{statement['page']}, {section_of(statement)}\n{statement['section_content']}"
+
+
+CHAT_TOOLS = {t.name: t for t in (search_findings, search_statements, search_documents, read_source)}
+
+AGENT_PROMPT = (
+    "You help a bid manager check a tender pack for contradictions. The pack has already "
+    "been read: its statements were compared and the contradictions stored as findings.\n"
+    "Answer from the tools, never from memory:\n"
+    "- search_findings for questions about conflicts and contradictions;\n"
+    "- search_statements to see every place a thing, property or value is mentioned;\n"
+    "- search_documents to read what the documents say about a topic;\n"
+    "- read_source to show the full clause or table a statement comes from.\n"
+    "Look things up before you answer, and look again when a first search finds nothing.\n"
+    "For every value you mention, give the document, page and section, and quote the words. "
+    "Say when a statement was superseded by an addendum or is information only. If the pack "
+    "does not answer the question, say so.\n"
+    "Write plain text without Markdown: short paragraphs, and '- ' for lists."
+)
+
+
+def answer(history, finding=None):
+    """The agent's reply to a conversation, given as (role, content) pairs, oldest first.
+    The model may call tools a few times; each result goes back to it until it answers.
+    When the conversation sits next to a finding, the agent is told which one."""
+    llm = ChatOpenAI(model=CHAT_MODEL, base_url=OPENAI_API_BASE, api_key=OPENAI_API_KEY,
+                     max_retries=3).bind_tools(list(CHAT_TOOLS.values()))
+    prompt = AGENT_PROMPT
+    if finding:
+        prompt += ("\n\nThe bid manager is looking at this finding, so 'this' and 'here' mean "
+                   "it:\n" + describe_finding(finding))
+    messages = [SystemMessage(prompt)]
+    for role, content in history:
+        messages.append(HumanMessage(content) if role == "user" else AIMessage(content))
+
+    for _ in range(MAX_AGENT_STEPS):
+        response = llm.invoke(messages)
+        messages.append(response)
+        if not response.tool_calls:
+            return response.text
+        for call in response.tool_calls:
+            print(f"   agent calls {call['name']}({call['args']})")
+            try:
+                result = CHAT_TOOLS[call["name"]].invoke(call["args"])
+            except Exception as error:  # a failed lookup is something the model can work around
+                result = f"The tool failed: {error}"
+            messages.append(ToolMessage(result, tool_call_id=call["id"]))
+    return "I could not finish looking that up. Try a narrower question."
+
+
+def conversation_messages(conn, conversation_id):
+    """(role, content) of every message in a conversation, oldest first."""
+    return conn.execute(
+        "SELECT role, content FROM messages WHERE conversation_id = %s ORDER BY message_id",
+        (conversation_id,),
+    ).fetchall()
+
+
+def finding_conversation(conn, finding_id):
+    """The conversation about one finding, started the first time the finding is shown."""
+    row = conn.execute("SELECT conversation_id FROM conversations WHERE finding_id = %s",
+                       (finding_id,)).fetchone()
+    if row:
+        return row[0]
+    return conn.execute("INSERT INTO conversations (finding_id) VALUES (%s) RETURNING conversation_id",
+                        (finding_id,)).fetchone()[0]
+
+
+@app.post("/chat")
+def new_chat():
+    """Start a conversation and open it."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        ensure_schema(conn)
+        conversation_id = conn.execute(
+            "INSERT INTO conversations DEFAULT VALUES RETURNING conversation_id"
+        ).fetchone()[0]
+    return RedirectResponse(f"/chat/{conversation_id}", status_code=303)
+
+
+@app.get("/chat/{conversation_id}")
+def chat(request: Request, conversation_id: str):
+    """Show a conversation and the box to ask the next question."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        ensure_schema(conn)
+        found = conn.execute("SELECT 1 FROM conversations WHERE conversation_id = %s",
+                             (conversation_id,)).fetchone()
+        messages = conversation_messages(conn, conversation_id)
+    if not found:
+        return Response("No such conversation.", status_code=404)
+    return templates.TemplateResponse(request, "chat.html", {
+        "conversation_id": conversation_id,
+        "messages": [{"role": role, "content": content} for role, content in messages],
+    })
+
+
+@app.post("/chat/{conversation_id}/messages")
+def send_message(request: Request, conversation_id: str, content: str = Form(...)):
+    """Store the question and show it, with a bubble that fetches the agent's reply."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES (%s, 'user', %s)",
+                     (conversation_id, content))
+    return templates.TemplateResponse(request, "chat_sent.html", {
+        "conversation_id": conversation_id, "content": content,
+    })
+
+
+@app.post("/chat/{conversation_id}/reply")
+def reply(request: Request, conversation_id: str):
+    """Let the agent answer the conversation so far, store the answer and show it."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        history = conversation_messages(conn, conversation_id)
+        finding_id = conn.execute("SELECT finding_id FROM conversations WHERE conversation_id = %s",
+                                  (conversation_id,)).fetchone()[0]
+        finding = next((f for f in load_findings(conn) if f["finding_id"] == finding_id), None)
+    try:
+        content = answer(history, finding)
+    except Exception as error:
+        print(f"!! the agent failed: {error}")
+        return templates.TemplateResponse(request, "chat_message.html", {
+            "message": {"role": "error", "content": "The agent failed to answer. The server log says why."},
+        })
+    with psycopg.connect(DATABASE_URL) as conn:
+        conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES (%s, 'assistant', %s)",
+                     (conversation_id, content))
+    return templates.TemplateResponse(request, "chat_message.html", {
+        "message": {"role": "assistant", "content": content},
+    })
 
 
 if __name__ == "__main__":
