@@ -37,6 +37,8 @@ EMBEDDING_BATCH = 64
 CHAT_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 CHAT_API_BASE = "https://api.deepinfra.com/v1/openai"
 EXTRACT_CONCURRENCY = 8  # chunks read in parallel, so a full pack does not take minutes
+CANDIDATE_CHUNKS = 8  # how many nearby chunks an amendment is compared against
+CANDIDATE_LIMIT = 30  # and the most statements taken from them
 
 app = FastAPI(title="Tender contradiction detection")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
@@ -218,6 +220,7 @@ def embed(texts):
             input=texts[start : start + EMBEDDING_BATCH],
             api_base=EMBEDDING_API_BASE,
             api_key=EMBEDDING_TOKEN,
+            num_retries=3,  # the host returns 429 "model busy" under load
         )
         vectors += [row["embedding"] for row in answer.data]
     return vectors
@@ -289,6 +292,7 @@ def extract_chain():
         base_url=CHAT_API_BASE,
         api_key=EMBEDDING_TOKEN,
         temperature=0,
+        max_retries=3,
     )
     return EXTRACT_PROMPT | llm.with_structured_output(StatementList, method="json_schema")
 
@@ -330,6 +334,114 @@ def quote_matches(quote, content):
 
 
 # --------------------------------------------------------------------------
+# Working out what an addendum has replaced
+# --------------------------------------------------------------------------
+
+class Amending(BaseModel):
+    """Whether a piece of text issues a binding change to the pack."""
+
+    is_amendment: bool = Field(
+        description="True only if this text itself changes what the pack requires."
+    )
+    reason: str = Field(description="One short sentence saying why.")
+
+
+AMENDMENT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Tender packs are corrected over time by addenda. Decide whether the text below "
+     "is itself a binding change to the pack.\n"
+     "Answer true when the text issues a change, for example by numbering itself as an "
+     "addendum item and saying that a value is replaced, superseded, deleted or now reads "
+     "differently.\n"
+     "Answer false for everything else, including:\n"
+     "- the original requirements themselves, which state rules but change nothing;\n"
+     "- answers to questions, clarifications and other text that is marked as information "
+     "only or that is not adopted by a numbered addendum;\n"
+     "- lists of what an addendum did NOT change;\n"
+     "- covers, contents tables, acknowledgements and records of meetings or visits.\n"
+     "A document can hold both binding and non-binding parts, so judge this text alone, "
+     "not the document it sits in."),
+    ("human", "Document: {doc}\nPage: {page}\nSection: {section}\n\n{content}"),
+])
+
+
+class Replaced(BaseModel):
+    replaced_statement_ids: list[str] = Field(
+        description="Ids of the statements this amendment replaces. Empty if it replaces none."
+    )
+    reason: str = Field(description="One short sentence saying what was replaced and why.")
+
+
+REPLACED_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "An addendum has changed the pack. You are given the amendment and a list of existing "
+     "statements. Say which of those statements the amendment has replaced.\n"
+     "A statement is replaced only when the amendment sets a new value for the SAME property "
+     "of the SAME thing, so that the old statement must no longer be followed.\n"
+     "Rules:\n"
+     "- Do not replace a statement about a different property, a different room or a "
+     "different piece of equipment.\n"
+     "- Do not replace a statement just because the amendment mentions it, refers to its "
+     "section, or says it is unchanged.\n"
+     "- An earlier addendum's statement can itself be replaced by a later one.\n"
+     "- When the amendment replaces nothing, return an empty list.\n"
+     "- Only use ids from the list you were given."),
+    ("human",
+     "Amendment ({doc} p{page}, {section}):\n"
+     "{entity} | {attribute} = {value} {unit}\n\"{quote}\"\n\n"
+     "Existing statements:\n{candidates}"),
+])
+
+
+def amendment_chain():
+    llm = ChatOpenAI(model=CHAT_MODEL, base_url=CHAT_API_BASE,
+                     api_key=EMBEDDING_TOKEN, temperature=0, max_retries=3)
+    return AMENDMENT_PROMPT | llm.with_structured_output(Amending, method="json_schema")
+
+
+def replaced_chain():
+    llm = ChatOpenAI(model=CHAT_MODEL, base_url=CHAT_API_BASE,
+                     api_key=EMBEDDING_TOKEN, temperature=0, max_retries=3)
+    return REPLACED_PROMPT | llm.with_structured_output(Replaced, method="json_schema")
+
+
+def find_amendment_chunks(chunks):
+    """Which chunks actually change the pack. Judged per chunk, not per document."""
+    results = amendment_chain().batch(
+        [
+            {
+                "doc": chunk["doc"],
+                "page": chunk["page"],
+                "section": " > ".join(
+                    h for h in (chunk["page_title"], chunk["section_parent"], chunk["section_heading"]) if h
+                ),
+                "content": chunk["section_content"],
+            }
+            for chunk in chunks
+        ],
+        config={"max_concurrency": EXTRACT_CONCURRENCY},
+        return_exceptions=True,
+    )
+    amending = set()
+    for chunk, result in zip(chunks, results):
+        if isinstance(result, Exception):
+            print(f"!! {chunk['chunk_id']} amendment check failed: {result}")
+            continue
+        if result.is_amendment:
+            amending.add(chunk["chunk_id"])
+            print(f"++ amendment {chunk['chunk_id']} {chunk['doc']} p{chunk['page']}: {result.reason}")
+    return amending
+
+
+def describe(statement):
+    """One line per statement, as the model sees it."""
+    value = " ".join(part for part in (statement["value"], statement["unit"]) if part)
+    return (f"{statement['statement_id']} | {statement['entity']} | "
+            f"{statement['attribute']} = {value or '(none)'} | "
+            f"{statement['doc']} p{statement['page']} | \"{statement['quote']}\"")
+
+
+# --------------------------------------------------------------------------
 # Database
 # --------------------------------------------------------------------------
 
@@ -363,7 +475,7 @@ def ensure_schema(conn):
             quote TEXT NOT NULL,
             source_chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
             status TEXT NOT NULL DEFAULT 'active',
-            superseded_by_fact_id TEXT
+            superseded_by_statement_id TEXT
         )
     """)
 
@@ -453,6 +565,103 @@ def extract():
 
     return (f"{len(found)} statements extracted from {len(chunks)} chunks"
             f"\n{unverified} quote(s) could not be found in their source chunk")
+
+
+STATEMENT_SQL = """
+    SELECT s.statement_id, s.entity, s.attribute, s.value, s.unit, s.quote,
+           s.source_chunk_id, c.doc, c.page, c.page_title, c.section_parent,
+           c.section_heading, c.section_content
+    FROM statements s JOIN chunks c ON c.chunk_id = s.source_chunk_id
+"""
+STATEMENT_COLUMNS = ["statement_id", "entity", "attribute", "value", "unit", "quote",
+                     "chunk_id", "doc", "page", "page_title", "section_parent",
+                     "section_heading", "section_content"]
+
+
+def fetch_statements(conn, where="", args=()):
+    rows = conn.execute(STATEMENT_SQL + where, args).fetchall()
+    return [dict(zip(STATEMENT_COLUMNS, row)) for row in rows]
+
+
+@app.post("/supersede", response_class=PlainTextResponse)
+def supersede():
+    """Find the addenda, and mark the statements they have replaced."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        ensure_schema(conn)
+        statements = fetch_statements(conn, " ORDER BY c.doc, c.page, s.statement_id")
+        if not statements:
+            return "No statements yet. Run Extract first."
+
+        # Only the chunks that carry statements are worth judging.
+        seen, chunks = set(), []
+        for statement in statements:
+            if statement["chunk_id"] not in seen:
+                seen.add(statement["chunk_id"])
+                chunks.append(statement)
+        amending_chunks = find_amendment_chunks(chunks)
+        amendments = [s for s in statements if s["chunk_id"] in amending_chunks]
+
+        # Re-running must start from a clean slate.
+        conn.execute("UPDATE statements SET status = 'active', superseded_by_statement_id = NULL")
+
+        # An amendment can only replace what already existed when it was issued, so each
+        # one is given a position and may not touch itself or any later amendment.
+        position = {}
+        for index, chunk_id in enumerate(dict.fromkeys(a["chunk_id"] for a in amendments)):
+            position[chunk_id] = index
+
+        replaced_count = 0
+        chain = replaced_chain()
+        # Oldest amendment first, so a later addendum overwrites an earlier one's decision.
+        for amendment in amendments:
+            mine = position[amendment["chunk_id"]]
+            later = [chunk_id for chunk_id, index in position.items() if index >= mine]
+            vector = to_vector(embed([describe(amendment)])[0])
+            candidates = fetch_statements(
+                conn,
+                """ WHERE s.source_chunk_id <> ALL(%s)
+                    ORDER BY (SELECT embedding FROM chunks WHERE chunk_id = s.source_chunk_id)
+                             <=> %s::vector
+                    LIMIT %s""",
+                (later, vector, CANDIDATE_LIMIT),
+            )
+            if not candidates:
+                continue
+
+            by_id = {c["statement_id"]: c for c in candidates}
+            answer = chain.invoke({
+                "doc": amendment["doc"],
+                "page": amendment["page"],
+                "section": amendment["section_heading"] or amendment["section_parent"],
+                "entity": amendment["entity"],
+                "attribute": amendment["attribute"],
+                "value": amendment["value"] or "",
+                "unit": amendment["unit"] or "",
+                "quote": amendment["quote"],
+                "candidates": "\n".join(describe(c) for c in candidates),
+            })
+
+            for statement_id in answer.replaced_statement_ids:
+                if statement_id not in by_id:
+                    continue  # the model invented an id
+                conn.execute(
+                    """UPDATE statements SET status = 'superseded',
+                                             superseded_by_statement_id = %s
+                       WHERE statement_id = %s""",
+                    (amendment["statement_id"], statement_id),
+                )
+                replaced_count += 1
+                old = by_id[statement_id]
+                print(f"-- {statement_id} ({old['entity']} {old['attribute']}="
+                      f"{old['value']}) superseded by {amendment['statement_id']}")
+
+        active = conn.execute(
+            "SELECT count(*) FROM statements WHERE status = 'active'"
+        ).fetchone()[0]
+
+    return (f"{len(amendments)} amending statement(s) found in {len(amending_chunks)} chunk(s)"
+            f"\n{replaced_count} statement(s) marked superseded"
+            f"\n{active} statement(s) still active")
 
 
 if __name__ == "__main__":
