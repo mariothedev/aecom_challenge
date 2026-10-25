@@ -13,6 +13,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import PlainTextResponse
 from fastapi.templating import Jinja2Templates
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
 # override=True: the shell may already define these names for other services.
@@ -30,6 +33,10 @@ EMBEDDING_MODEL = "openai/Qwen/Qwen3-Embedding-0.6B"
 EMBEDDING_API_BASE = "https://api.deepinfra.com/v1/openai"
 EMBEDDING_DIM = 1024
 EMBEDDING_BATCH = 64
+
+CHAT_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+CHAT_API_BASE = "https://api.deepinfra.com/v1/openai"
+EXTRACT_CONCURRENCY = 8  # chunks read in parallel, so a full pack does not take minutes
 
 app = FastAPI(title="Tender contradiction detection")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
@@ -232,6 +239,97 @@ def to_vector(values):
 
 
 # --------------------------------------------------------------------------
+# Reading statements out of a chunk
+# --------------------------------------------------------------------------
+
+class Statement(BaseModel):
+    """One thing the pack requires, stated about one entity."""
+
+    entity: str = Field(description="What the statement is about, as the document names it.")
+    equipment_tag: str | None = Field(
+        default=None, description="Tag such as D-01, BW-D, FA-01 or G-C01, if one is given."
+    )
+    attribute: str = Field(
+        description="The property being fixed, in snake_case, e.g. maximum_dogs, "
+                    "water_bowl_capacity, gate_height, supplier, cleaning_frequency."
+    )
+    value: str | None = Field(
+        default=None, description="The value alone, without its unit, e.g. '120', '3', 'Club Team'."
+    )
+    unit: str | None = Field(default=None, description="The unit alone, e.g. 'cm', 'litres', 'kW'.")
+    quote: str = Field(description="The shortest run of words from the text that proves this, copied exactly.")
+
+
+class StatementList(BaseModel):
+    statements: list[Statement]
+
+
+EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You read tender documents and record what they require.\n"
+     "List every statement in the text that fixes a value, a quantity, a date, a "
+     "responsibility or a rule. Split each one so that a single statement covers a "
+     "single attribute of a single entity.\n"
+     "Rules:\n"
+     "- Quote exactly. Copy the words from the text; never paraphrase or correct them.\n"
+     "- Keep value and unit apart: '120' and 'cm', not '120 cm'.\n"
+     "- Use the same snake_case attribute name for the same property wherever it appears, "
+     "so the same property can be compared across documents.\n"
+     "- Record what the text says even when it looks wrong or disagrees with another document.\n"
+     "- Skip background prose, introductions and anything that fixes nothing.\n"
+     "Return an empty list if the text states no requirement."),
+    ("human",
+     "Document: {doc}\nPage: {page}\nSection: {section}\n\n{content}"),
+])
+
+
+def extract_chain():
+    llm = ChatOpenAI(
+        model=CHAT_MODEL,
+        base_url=CHAT_API_BASE,
+        api_key=EMBEDDING_TOKEN,
+        temperature=0,
+    )
+    return EXTRACT_PROMPT | llm.with_structured_output(StatementList, method="json_schema")
+
+
+def extract_statements(chunks):
+    """Ask the model what each chunk requires. Returns (chunk_id, Statement) pairs."""
+    chain = extract_chain()
+    inputs = [
+        {
+            "doc": chunk["doc"],
+            "page": chunk["page"],
+            "section": " > ".join(
+                h for h in (chunk["page_title"], chunk["section_parent"], chunk["section_heading"]) if h
+            ),
+            "content": chunk["section_content"],
+        }
+        for chunk in chunks
+    ]
+    results = chain.batch(
+        inputs,
+        config={"max_concurrency": EXTRACT_CONCURRENCY},
+        return_exceptions=True,
+    )
+
+    found = []
+    for chunk, result in zip(chunks, results):
+        if isinstance(result, Exception):
+            print(f"!! {chunk['chunk_id']} failed: {result}")
+            continue
+        for statement in result.statements:
+            found.append((chunk, statement))
+    return found
+
+
+def quote_matches(quote, content):
+    """True when the quote really is in the chunk, ignoring how whitespace fell."""
+    flat = lambda text: re.sub(r"\s+", " ", text).strip().lower()
+    return flat(quote) in flat(content)
+
+
+# --------------------------------------------------------------------------
 # Database
 # --------------------------------------------------------------------------
 
@@ -251,6 +349,23 @@ def ensure_schema(conn):
             embedding vector(%s)
         )
     """ % EMBEDDING_DIM)
+    conn.execute("CREATE SEQUENCE IF NOT EXISTS statement_seq")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS statements (
+            statement_id TEXT PRIMARY KEY
+                DEFAULT 'statement_' || lpad(nextval('statement_seq')::text, 6, '0'),
+            entity TEXT NOT NULL,
+            canonical_entity TEXT,
+            equipment_tag TEXT,
+            attribute TEXT NOT NULL,
+            value TEXT,
+            unit TEXT,
+            quote TEXT NOT NULL,
+            source_chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'active',
+            superseded_by_fact_id TEXT
+        )
+    """)
 
 
 def save_chunks(conn, filename, chunks, vectors):
@@ -301,7 +416,46 @@ async def uploads(files: list[UploadFile] = File(...)):
     return "\n".join(lines)
 
 
+@app.post("/extract", response_class=PlainTextResponse)
+def extract():
+    """Read every stored chunk and record the statements it makes."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        ensure_schema(conn)
+        chunks = conn.execute(
+            """SELECT chunk_id, doc, page, page_title, section_parent, section_heading, section_content
+               FROM chunks ORDER BY chunk_id"""
+        ).fetchall()
+        columns = ["chunk_id", "doc", "page", "page_title", "section_parent",
+                   "section_heading", "section_content"]
+        chunks = [dict(zip(columns, row)) for row in chunks]
+        if not chunks:
+            return "No chunks stored yet. Upload the pack first."
+
+        found = extract_statements(chunks)
+
+        conn.execute("DELETE FROM statements")
+        unverified = 0
+        with conn.cursor() as cur:
+            for chunk, statement in found:
+                if not quote_matches(statement.quote, chunk["section_content"]):
+                    unverified += 1
+                    print(f"?? quote not found in {chunk['chunk_id']}: {statement.quote!r}")
+                cur.execute(
+                    """INSERT INTO statements (entity, equipment_tag, attribute, value, unit,
+                                               quote, source_chunk_id)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)
+                       RETURNING statement_id""",
+                    (statement.entity, statement.equipment_tag, statement.attribute,
+                     statement.value, statement.unit, statement.quote, chunk["chunk_id"]),
+                )
+                print(f"[{cur.fetchone()[0]}] {statement.entity} | {statement.attribute} "
+                      f"= {statement.value} {statement.unit or ''} ({chunk['doc']} p{chunk['page']})")
+
+    return (f"{len(found)} statements extracted from {len(chunks)} chunks"
+            f"\n{unverified} quote(s) could not be found in their source chunk")
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8080)
