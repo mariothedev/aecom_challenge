@@ -7,7 +7,6 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
-import litellm
 import pdfplumber
 import psycopg
 import pymupdf
@@ -16,28 +15,26 @@ from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
-# Load local development settings; deployment environment variables are set by the host.
-load_dotenv(BASE_DIR / ".env.development", override=True)
+# Optional local settings; existing host environment variables take precedence.
+load_dotenv(BASE_DIR / ".env", override=False)
 DATABASE_URL = os.environ["DATABASE_URL"]
-EMBEDDING_TOKEN = os.environ["DEEPL_TOKEN"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+OPENAI_API_BASE = "https://api.openai.com/v1"
 
 HEADER_Y = 50  # running headers sit above this point on the page
 FOOTER_Y = 790  # page numbers sit below this point
 MAX_HEADING_CHARS = 120  # a heading is always a short line
 MAX_CHUNK_CHARS = 1800  # split longer sections so chunks stay retrievable
 
-# DeepInfra speaks the OpenAI dialect, so LiteLLM reaches it through the openai route.
-EMBEDDING_MODEL = "openai/Qwen/Qwen3-Embedding-0.6B"
-EMBEDDING_API_BASE = "https://api.deepinfra.com/v1/openai"
-EMBEDDING_DIM = 1024
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_DIM = 1024  # keep the existing pgvector column size
 EMBEDDING_BATCH = 64
 
-CHAT_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
-CHAT_API_BASE = "https://api.deepinfra.com/v1/openai"
+CHAT_MODEL = "gpt-6.1-sol"
 EXTRACT_CONCURRENCY = 8  # chunks read in parallel, so a full pack does not take minutes
 CANDIDATE_LIMIT = 30  # statements from nearby chunks an amendment is compared against
 
@@ -262,17 +259,15 @@ def make_chunks(content, filename):
 
 def embed(texts):
     """Turn texts into vectors, a batch at a time."""
-    vectors = []
-    for start in range(0, len(texts), EMBEDDING_BATCH):
-        answer = litellm.embedding(
-            model=EMBEDDING_MODEL,
-            input=texts[start : start + EMBEDDING_BATCH],
-            api_base=EMBEDDING_API_BASE,
-            api_key=EMBEDDING_TOKEN,
-            num_retries=3,  # the host returns 429 "model busy" under load
-        )
-        vectors += [row["embedding"] for row in answer.data]
-    return vectors
+    embeddings = OpenAIEmbeddings(
+        model=EMBEDDING_MODEL,
+        dimensions=EMBEDDING_DIM,
+        base_url=OPENAI_API_BASE,
+        api_key=OPENAI_API_KEY,
+        chunk_size=EMBEDDING_BATCH,
+        max_retries=3,
+    )
+    return embeddings.embed_documents(texts)
 
 
 def embedding_text(chunk):
@@ -356,8 +351,8 @@ EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
 def extract_chain():
     llm = ChatOpenAI(
         model=CHAT_MODEL,
-        base_url=CHAT_API_BASE,
-        api_key=EMBEDDING_TOKEN,
+        base_url=OPENAI_API_BASE,
+        api_key=OPENAI_API_KEY,
         temperature=0,
         max_retries=3,
     )
@@ -564,8 +559,8 @@ ATTRIBUTE_NAMES_PROMPT = ChatPromptTemplate.from_messages([
 
 
 def names_chain(prompt):
-    llm = ChatOpenAI(model=CHAT_MODEL, base_url=CHAT_API_BASE,
-                     api_key=EMBEDDING_TOKEN, temperature=0, max_retries=3)
+    llm = ChatOpenAI(model=CHAT_MODEL, base_url=OPENAI_API_BASE,
+                     api_key=OPENAI_API_KEY, temperature=0, max_retries=3)
     return prompt | llm.with_structured_output(NameGroups, method="json_schema")
 
 
@@ -722,14 +717,14 @@ REPLACED_PROMPT = ChatPromptTemplate.from_messages([
 
 
 def amendment_chain():
-    llm = ChatOpenAI(model=CHAT_MODEL, base_url=CHAT_API_BASE,
-                     api_key=EMBEDDING_TOKEN, temperature=0, max_retries=3)
+    llm = ChatOpenAI(model=CHAT_MODEL, base_url=OPENAI_API_BASE,
+                     api_key=OPENAI_API_KEY, temperature=0, max_retries=3)
     return AMENDMENT_PROMPT | llm.with_structured_output(Amending, method="json_schema")
 
 
 def replaced_chain():
-    llm = ChatOpenAI(model=CHAT_MODEL, base_url=CHAT_API_BASE,
-                     api_key=EMBEDDING_TOKEN, temperature=0, max_retries=3)
+    llm = ChatOpenAI(model=CHAT_MODEL, base_url=OPENAI_API_BASE,
+                     api_key=OPENAI_API_KEY, temperature=0, max_retries=3)
     return REPLACED_PROMPT | llm.with_structured_output(Replaced, method="json_schema")
 
 
@@ -820,8 +815,8 @@ JUDGE_PROMPT = ChatPromptTemplate.from_messages([
 
 
 def judge_chain():
-    llm = ChatOpenAI(model=CHAT_MODEL, base_url=CHAT_API_BASE,
-                     api_key=EMBEDDING_TOKEN, temperature=0, max_retries=3)
+    llm = ChatOpenAI(model=CHAT_MODEL, base_url=OPENAI_API_BASE,
+                     api_key=OPENAI_API_KEY, temperature=0, max_retries=3)
     return JUDGE_PROMPT | llm.with_structured_output(Verdict, method="json_schema")
 
 

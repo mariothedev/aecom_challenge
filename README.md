@@ -1,17 +1,15 @@
 # Requirements
 
-Before you can get the app running, you must have the three (3) following environment variables in your machine:
+Create a `.env` file in the project root with these values, or set them on the host machine:
 
-```bash
-DATABASE_URL="postgresql://postgres..."
-DEEPL_TOKEN="sk-di-cRv3i..."
-OPENAI_TOKEN="sk-proj-PNuCY...."
+```dotenv
+DATABASE_URL="postgresql://user:password@localhost:5432/dbname"
+OPENAI_API_KEY="your-openai-api-key"
 ```
-
 
 # Getting started
 
-Install the dependencies and start the FastAPI server:
+After saving `.env`, install the dependencies and start the FastAPI server from the project root:
 
 ```bash
 pip install -r requirements.txt
