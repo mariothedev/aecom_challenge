@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Tender contradiction detection</title>
+  </head>
+  <body>
+    <h1>Upload tender pack</h1>
+    <form action="/uploads" method="post" enctype="multipart/form-data">
+      <input type="file" name="files" accept="application/pdf" multiple>
+      <button type="submit">Upload</button>
+    </form>
+
+    <h1>Extract statements</h1>
+    <form action="/extract" method="post">
+      <button type="submit">Extract</button>
+    </form>
+
+    <h1>Apply addenda</h1>
+    <form action="/supersede" method="post">
+      <button type="submit">Supersede</button>
+    </form>
+
+    <h1>Scan for contradictions</h1>
+    <form action="/scan" method="post">
+      <button type="submit">Scan</button>
+    </form>
+  </body>
+</html>

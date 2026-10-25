@@ -1,0 +1,1 @@
+You're an AI enginner. Your task is to create a performant RAG pipeline powered by LangChain using Python. Keep your code simple. Avoid unnecessary abstractions. Avoid hard to understand code. Avoid classes. Code in a minimalistic and prodecural style. A kid should be able to understand your code.
