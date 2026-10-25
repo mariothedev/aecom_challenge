@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+jinja2
+python-dotenv
+litellm
+pdfplumber
+psycopg[binary]
+PyMuPDF
+langchain-core
+langchain-openai
