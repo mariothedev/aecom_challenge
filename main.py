@@ -4,6 +4,7 @@ import io
 import os
 import re
 from pathlib import Path
+from typing import Literal
 
 import litellm
 import pdfplumber
@@ -11,7 +12,7 @@ import psycopg
 import pymupdf
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Request, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -39,6 +40,9 @@ CHAT_API_BASE = "https://api.deepinfra.com/v1/openai"
 EXTRACT_CONCURRENCY = 8  # chunks read in parallel, so a full pack does not take minutes
 CANDIDATE_CHUNKS = 8  # how many nearby chunks an amendment is compared against
 CANDIDATE_LIMIT = 30  # and the most statements taken from them
+
+NEIGHBOURS = 7  # statements compared against each statement when hunting contradictions
+MIN_SIMILARITY = 0.70  # below this, two statements are not about the same thing
 
 app = FastAPI(title="Tender contradiction detection")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
@@ -433,6 +437,99 @@ def find_amendment_chunks(chunks):
     return amending
 
 
+# --------------------------------------------------------------------------
+# Finding contradictions
+# --------------------------------------------------------------------------
+
+class Contradiction(BaseModel):
+    statement_a_id: str = Field(description="Id of the first statement, from the list given.")
+    statement_b_id: str = Field(description="Id of the second statement, from the list given.")
+    canonical_entity: str = Field(
+        description="One short name for the thing both statements are about, e.g. FZ-01 or main_hall."
+    )
+    attribute: str = Field(description="The property they disagree about, in snake_case.")
+    category: Literal["numeric", "unit", "scope", "date_arithmetic", "omission",
+                      "terminology", "superseded_text", "other"]
+    severity: Literal["high", "medium", "low"] = Field(
+        description="How much money or risk follows from getting this wrong."
+    )
+    confidence: float = Field(description="How sure you are this is a real contradiction, 0 to 1.")
+    explanation: str = Field(description="One or two sentences saying what disagrees and why it matters.")
+    quote_a: str = Field(description="The words from statement A, copied exactly.")
+    quote_b: str = Field(description="The words from statement B, copied exactly.")
+
+
+class ContradictionList(BaseModel):
+    contradictions: list[Contradiction]
+
+
+JUDGE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You check tender documents for statements that contradict each other.\n"
+     "Below are statements that are already known to be about similar things. Report only "
+     "the pairs that genuinely cannot both be followed.\n"
+     "Two statements contradict when they fix the SAME property of the SAME thing to values "
+     "that cannot both hold.\n"
+     "Before deciding, convert units and do the arithmetic. Values that are equal once "
+     "converted do NOT contradict, however differently they are written.\n"
+     "Do NOT report:\n"
+     "- statements about different rooms, tags, items or documents;\n"
+     "- a preference or a permission against a requirement; allowing something and "
+     "preferring something else is not a disagreement;\n"
+     "- two statements that agree, repeat each other, or simply differ in wording;\n"
+     "- a spare or surplus quantity that is merely larger than a minimum.\n"
+     "Use category 'superseded_text' when the two statements disagreed but an addendum has "
+     "already settled it; the marked status tells you this. Use 'omission' when a list that "
+     "claims to be complete is missing an item another statement requires.\n"
+     "Severity is about consequence: money, safety or programme impact is high; wording and "
+     "already-settled differences are low.\n"
+     "Quote exactly from the statements you were given. Only use ids from the list.\n"
+     "Return an empty list when nothing truly contradicts."),
+    ("human", "Statements:\n{statements}"),
+])
+
+
+def judge_chain():
+    llm = ChatOpenAI(model=CHAT_MODEL, base_url=CHAT_API_BASE,
+                     api_key=EMBEDDING_TOKEN, temperature=0, max_retries=3)
+    return JUDGE_PROMPT | llm.with_structured_output(ContradictionList, method="json_schema")
+
+
+def statement_text(statement):
+    """What we embed for a statement: enough to tell what it is about."""
+    value = " ".join(part for part in (statement["value"], statement["unit"]) if part)
+    return (f"{statement['entity']} | {statement['attribute']} = {value or '(none)'}\n"
+            f"{statement['quote']}")
+
+
+def describe_for_judge(statement):
+    value = " ".join(part for part in (statement["value"], statement["unit"]) if part)
+    where = f"{statement['doc']} p{statement['page']}"
+    section = statement["section_heading"] or statement["section_parent"]
+    if section:
+        where += f", {section}"
+    return (f"{statement['statement_id']} [{statement['status']}] | {statement['entity']} | "
+            f"{statement['attribute']} = {value or '(none)'} | {where} | \"{statement['quote']}\"")
+
+
+def build_clusters(conn, statements):
+    """Group each statement with its nearest neighbours, then drop duplicate groups."""
+    clusters = {}
+    for statement in statements:
+        rows = conn.execute(
+            """SELECT statement_id, 1 - (embedding <=> %s::vector) AS similarity
+               FROM statements
+               WHERE statement_id <> %s AND embedding IS NOT NULL
+               ORDER BY embedding <=> %s::vector LIMIT %s""",
+            (statement["vector"], statement["statement_id"], statement["vector"], NEIGHBOURS),
+        ).fetchall()
+        group = {statement["statement_id"]}
+        group.update(row[0] for row in rows if row[1] >= MIN_SIMILARITY)
+        if len(group) > 1:
+            clusters[frozenset(group)] = None
+    return list(clusters)
+
+
 def describe(statement):
     """One line per statement, as the model sees it."""
     value = " ".join(part for part in (statement["value"], statement["unit"]) if part)
@@ -476,6 +573,29 @@ def ensure_schema(conn):
             source_chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
             status TEXT NOT NULL DEFAULT 'active',
             superseded_by_statement_id TEXT
+        )
+    """)
+    conn.execute(
+        "ALTER TABLE statements ADD COLUMN IF NOT EXISTS embedding vector(%s)" % EMBEDDING_DIM
+    )
+    conn.execute("CREATE SEQUENCE IF NOT EXISTS contradiction_seq")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS contradictions (
+            contradiction_id TEXT PRIMARY KEY
+                DEFAULT 'contradiction_' || lpad(nextval('contradiction_seq')::text, 6, '0'),
+            statement_a_id TEXT NOT NULL REFERENCES statements(statement_id) ON DELETE CASCADE,
+            statement_b_id TEXT NOT NULL REFERENCES statements(statement_id) ON DELETE CASCADE,
+            canonical_entity TEXT NOT NULL DEFAULT '',
+            attribute TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            explanation TEXT NOT NULL,
+            quote_a TEXT NOT NULL,
+            quote_b TEXT NOT NULL,
+            review_status TEXT NOT NULL DEFAULT 'unreviewed',
+            review_note TEXT,
+            UNIQUE (statement_a_id, statement_b_id)
         )
     """)
 
@@ -569,13 +689,13 @@ def extract():
 
 STATEMENT_SQL = """
     SELECT s.statement_id, s.entity, s.attribute, s.value, s.unit, s.quote,
-           s.source_chunk_id, c.doc, c.page, c.page_title, c.section_parent,
-           c.section_heading, c.section_content
+           s.source_chunk_id, s.status, s.embedding, c.doc, c.page, c.page_title,
+           c.section_parent, c.section_heading, c.section_content
     FROM statements s JOIN chunks c ON c.chunk_id = s.source_chunk_id
 """
 STATEMENT_COLUMNS = ["statement_id", "entity", "attribute", "value", "unit", "quote",
-                     "chunk_id", "doc", "page", "page_title", "section_parent",
-                     "section_heading", "section_content"]
+                     "chunk_id", "status", "embedding", "doc", "page", "page_title",
+                     "section_parent", "section_heading", "section_content"]
 
 
 def fetch_statements(conn, where="", args=()):
@@ -662,6 +782,92 @@ def supersede():
     return (f"{len(amendments)} amending statement(s) found in {len(amending_chunks)} chunk(s)"
             f"\n{replaced_count} statement(s) marked superseded"
             f"\n{active} statement(s) still active")
+
+
+SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+@app.post("/scan")
+def scan():
+    """Compare statements with one another and record the contradictions."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        ensure_schema(conn)
+        statements = fetch_statements(conn, " ORDER BY s.statement_id")
+        if not statements:
+            return JSONResponse({"contradictions": [], "message": "No statements yet. Run Extract first."})
+
+        # Statements need their own vectors so we can ask which ones talk about the same thing.
+        missing = [s for s in statements if s["embedding"] is None]
+        if missing:
+            vectors = embed([statement_text(s) for s in missing])
+            with conn.cursor() as cur:
+                for statement, vector in zip(missing, vectors):
+                    cur.execute("UPDATE statements SET embedding = %s::vector WHERE statement_id = %s",
+                                (to_vector(vector), statement["statement_id"]))
+            statements = fetch_statements(conn, " ORDER BY s.statement_id")
+
+        by_id = {s["statement_id"]: s for s in statements}
+        for statement in statements:
+            statement["vector"] = statement["embedding"]
+        clusters = build_clusters(conn, statements)
+        print(f"{len(clusters)} cluster(s) to judge")
+
+        results = judge_chain().batch(
+            [{"statements": "\n".join(describe_for_judge(by_id[i]) for i in sorted(cluster))}
+             for cluster in clusters],
+            config={"max_concurrency": EXTRACT_CONCURRENCY},
+            return_exceptions=True,
+        )
+
+        conn.execute("DELETE FROM contradictions")
+        seen, skipped = set(), 0
+        with conn.cursor() as cur:
+            for cluster, result in zip(clusters, results):
+                if isinstance(result, Exception):
+                    print(f"!! cluster judging failed: {result}")
+                    continue
+                for found in result.contradictions:
+                    a, b = found.statement_a_id, found.statement_b_id
+                    if a not in by_id or b not in by_id or a == b:
+                        skipped += 1
+                        continue
+                    pair = tuple(sorted((a, b)))
+                    if pair in seen:
+                        continue  # the same pair can surface from two overlapping clusters
+                    # The quotes must really be in the statements they are attributed to.
+                    if not (quote_matches(found.quote_a, by_id[a]["quote"])
+                            and quote_matches(found.quote_b, by_id[b]["quote"])):
+                        skipped += 1
+                        print(f"?? unverified quotes for {a}/{b}")
+                        continue
+                    seen.add(pair)
+                    cur.execute(
+                        """INSERT INTO contradictions (statement_a_id, statement_b_id,
+                               canonical_entity, attribute, category, severity, confidence,
+                               explanation, quote_a, quote_b)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (pair[0], pair[1], found.canonical_entity, found.attribute,
+                         found.category, found.severity, min(max(found.confidence, 0.0), 1.0),
+                         found.explanation,
+                         found.quote_a if pair[0] == a else found.quote_b,
+                         found.quote_b if pair[0] == a else found.quote_a),
+                    )
+
+        rows = conn.execute("""
+            SELECT contradiction_id, statement_a_id, statement_b_id, canonical_entity, attribute,
+                   category, severity, confidence, explanation, quote_a, quote_b,
+                   review_status, review_note
+            FROM contradictions
+        """).fetchall()
+
+    columns = ["contradiction_id", "statement_a_id", "statement_b_id", "canonical_entity",
+               "attribute", "category", "severity", "confidence", "explanation",
+               "quote_a", "quote_b", "review_status", "review_note"]
+    findings = [dict(zip(columns, row)) for row in rows]
+    # Severity first, then confidence: a certain cosmetic issue stays below an uncertain costly one.
+    findings.sort(key=lambda f: (SEVERITY_ORDER.get(f["severity"], 3), -f["confidence"]))
+    print(f"{len(findings)} contradiction(s) stored, {skipped} rejected")
+    return JSONResponse({"contradictions": findings})
 
 
 if __name__ == "__main__":
