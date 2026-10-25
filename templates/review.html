@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block content %}
+{% set severity_dot = {"high": "bg-red-500", "medium": "bg-amber-400", "low": "bg-sky-400"} %}
+<div class="mx-auto max-w-6xl px-4 py-8 sm:px-6 lg:py-12">
+  <header class="flex items-center justify-between text-sm text-neutral-500">
+    <a href="/" class="hover:text-white">← Upload new pack</a>
+    <span>Finding <span class="text-white">{{ number }}</span> of {{ total }}</span>
+  </header>
+
+  <div class="mt-8 grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
+    <main>
+      <h1 class="text-2xl font-semibold text-white">{{ finding.entity }}</h1>
+      <p class="mt-1 text-neutral-400">{{ finding.attribute | replace("_", " ") | capitalize }}</p>
+      <p class="mt-4 max-w-prose leading-relaxed">{{ finding.explanation }}</p>
+
+      <table class="mt-8 w-full table-fixed border-separate border-spacing-0 overflow-hidden rounded-xl border border-neutral-800">
+        <thead class="bg-neutral-900 text-left">
+          <tr>
+            {% for label, values in [("A", values_a), ("B", values_b)] %}
+            <th class="border-b border-neutral-800 p-4 align-top font-normal {{ 'border-l' if label == 'B' }}">
+              <span class="text-xs font-medium text-neutral-500">Side {{ label }}</span>
+              <span class="mt-1 block break-words text-lg font-semibold text-white">{{ values or "—" }}</span>
+            </th>
+            {% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            {% for label, side in [("A", side_a), ("B", side_b)] %}
+            <td class="p-4 align-top {{ 'border-l border-neutral-800' if label == 'B' }}">
+              <ul class="space-y-5">
+                {% for statement in side %}
+                <li>
+                  <div class="flex flex-wrap items-center gap-2 text-xs">
+                    <span class="font-mono text-neutral-500">{{ label }}{{ loop.index }}</span>
+                    {% if statement.status == "superseded" %}
+                    <span class="rounded bg-amber-400/10 px-1.5 py-0.5 text-amber-300">Superseded</span>
+                    {% endif %}
+                    {% if statement.kind != "requirement" %}
+                    <span class="rounded bg-neutral-800 px-1.5 py-0.5 text-neutral-400">{{ statement.kind | replace("_", " ") | capitalize }}</span>
+                    {% endif %}
+                  </div>
+                  <blockquote class="mt-1.5 break-words text-neutral-100">“{{ statement.quote }}”</blockquote>
+                </li>
+                {% endfor %}
+              </ul>
+            </td>
+            {% endfor %}
+          </tr>
+        </tbody>
+      </table>
+
+      <form method="post" action="/review/{{ number }}" class="mt-6 flex gap-3">
+        <input type="hidden" name="finding_id" value="{{ finding.finding_id }}">
+        <button name="decision" value="confirmed" class="rounded-lg bg-white px-6 py-2.5 font-medium text-neutral-950 hover:bg-neutral-200">Confirm</button>
+        <button name="decision" value="dismissed" class="rounded-lg border border-neutral-700 px-6 py-2.5 font-medium text-white hover:bg-neutral-800">Dismiss</button>
+      </form>
+    </main>
+
+    <aside class="self-start rounded-xl border border-neutral-800 bg-neutral-900 p-5 text-sm">
+      <dl class="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2">
+        <dt class="text-neutral-500">Topic</dt>
+        <dd class="text-white">{{ finding.entity }} / {{ finding.attribute | replace("_", " ") }}</dd>
+        <dt class="text-neutral-500">Severity</dt>
+        <dd class="flex items-center gap-2 text-white">
+          <span class="size-2 rounded-full {{ severity_dot.get(finding.severity, 'bg-neutral-500') }}"></span>{{ finding.severity | capitalize }}
+        </dd>
+        <dt class="text-neutral-500">Confidence</dt>
+        <dd class="text-white">{{ (finding.confidence * 100) | round | int }}%</dd>
+        <dt class="text-neutral-500">Category</dt>
+        <dd class="text-white">{{ finding.category | replace("_", " ") | capitalize }}</dd>
+        <dt class="text-neutral-500">Review</dt>
+        <dd class="text-white">{{ finding.review_status | capitalize }}</dd>
+      </dl>
+
+      <h2 class="mt-6 border-t border-neutral-800 pt-5 text-xs font-medium uppercase tracking-wide text-neutral-500">Sources</h2>
+      <ul class="mt-4 space-y-5">
+        {% for label, side in [("A", side_a), ("B", side_b)] %}
+        {% for statement in side %}
+        <li class="flex gap-3">
+          <span class="pt-0.5 font-mono text-xs text-neutral-500">{{ label }}{{ loop.index }}</span>
+          <div class="min-w-0">
+            <p class="text-white">{{ statement.page_title }}</p>
+            <p class="break-all text-xs text-neutral-500">{{ statement.doc }}</p>
+            <dl class="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
+              <dt class="text-neutral-500">Page</dt>
+              <dd>{{ statement.page }}</dd>
+              {% if statement.section %}
+              <dt class="text-neutral-500">Section</dt>
+              <dd class="break-words">{{ statement.section }}</dd>
+              {% endif %}
+              {% if statement.table %}
+              <dt class="text-neutral-500">Table</dt>
+              <dd class="break-words">{{ statement.table }}</dd>
+              {% endif %}
+              {% if statement.equipment_tag %}
+              <dt class="text-neutral-500">Tag</dt>
+              <dd class="font-mono">{{ statement.equipment_tag }}</dd>
+              {% endif %}
+            </dl>
+          </div>
+        </li>
+        {% endfor %}
+        {% endfor %}
+      </ul>
+    </aside>
+  </div>
+</div>
+{% endblock %}

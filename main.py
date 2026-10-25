@@ -11,16 +11,17 @@ import pdfplumber
 import psycopg
 import pymupdf
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Request, UploadFile
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
-# Optional local settings; existing host environment variables take precedence.
-load_dotenv(BASE_DIR / ".env", override=False)
+# Local settings in .env win over the shell, which may hold keys for other projects.
+# The Docker image has no .env, so there the host's environment variables are used.
+load_dotenv(BASE_DIR / ".env", override=True)
 DATABASE_URL = os.environ["DATABASE_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 OPENAI_API_BASE = "https://api.openai.com/v1"
@@ -353,7 +354,6 @@ def extract_chain():
         model=CHAT_MODEL,
         base_url=OPENAI_API_BASE,
         api_key=OPENAI_API_KEY,
-        temperature=0,
         max_retries=3,
     )
     return EXTRACT_PROMPT | llm.with_structured_output(StatementList, method="json_schema")
@@ -560,7 +560,7 @@ ATTRIBUTE_NAMES_PROMPT = ChatPromptTemplate.from_messages([
 
 def names_chain(prompt):
     llm = ChatOpenAI(model=CHAT_MODEL, base_url=OPENAI_API_BASE,
-                     api_key=OPENAI_API_KEY, temperature=0, max_retries=3)
+                     api_key=OPENAI_API_KEY, max_retries=3)
     return prompt | llm.with_structured_output(NameGroups, method="json_schema")
 
 
@@ -718,13 +718,13 @@ REPLACED_PROMPT = ChatPromptTemplate.from_messages([
 
 def amendment_chain():
     llm = ChatOpenAI(model=CHAT_MODEL, base_url=OPENAI_API_BASE,
-                     api_key=OPENAI_API_KEY, temperature=0, max_retries=3)
+                     api_key=OPENAI_API_KEY, max_retries=3)
     return AMENDMENT_PROMPT | llm.with_structured_output(Amending, method="json_schema")
 
 
 def replaced_chain():
     llm = ChatOpenAI(model=CHAT_MODEL, base_url=OPENAI_API_BASE,
-                     api_key=OPENAI_API_KEY, temperature=0, max_retries=3)
+                     api_key=OPENAI_API_KEY, max_retries=3)
     return REPLACED_PROMPT | llm.with_structured_output(Replaced, method="json_schema")
 
 
@@ -816,7 +816,7 @@ JUDGE_PROMPT = ChatPromptTemplate.from_messages([
 
 def judge_chain():
     llm = ChatOpenAI(model=CHAT_MODEL, base_url=OPENAI_API_BASE,
-                     api_key=OPENAI_API_KEY, temperature=0, max_retries=3)
+                     api_key=OPENAI_API_KEY, max_retries=3)
     return JUDGE_PROMPT | llm.with_structured_output(Verdict, method="json_schema")
 
 
@@ -1025,12 +1025,12 @@ STATEMENT_SQL = """
     SELECT s.statement_id, COALESCE(s.canonical_entity, s.entity),
            COALESCE(s.canonical_attribute, s.attribute), s.value, s.unit, s.normal_value, s.quote,
            s.kind, s.source_chunk_id, s.status, c.doc, c.page, c.page_title,
-           c.section_parent, c.section_heading, c.section_content
+           c.section_parent, c.section_heading, c.section_content, s.equipment_tag
     FROM statements s JOIN chunks c ON c.chunk_id = s.source_chunk_id
 """
 STATEMENT_COLUMNS = ["statement_id", "entity", "attribute", "value", "unit", "normal_value",
                      "quote", "kind", "chunk_id", "status", "doc", "page", "page_title",
-                     "section_parent", "section_heading", "section_content"]
+                     "section_parent", "section_heading", "section_content", "equipment_tag"]
 
 
 def fetch_statements(conn, where="", args=()):
@@ -1143,6 +1143,27 @@ def supersede():
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
+def load_findings(conn):
+    """Every stored finding with its statements, most severe first, then most certain."""
+    rows = conn.execute("""
+        SELECT finding_id, entity, attribute, statement_ids, category, severity, confidence,
+               explanation, review_status, review_note
+        FROM findings ORDER BY finding_id
+    """).fetchall()
+    columns = ["finding_id", "entity", "attribute", "statement_ids", "category", "severity",
+               "confidence", "explanation", "review_status", "review_note"]
+    findings = [dict(zip(columns, row)) for row in rows]
+
+    ids = [i for finding in findings for i in finding["statement_ids"]]
+    by_id = {s["statement_id"]: s for s in fetch_statements(conn, " WHERE s.statement_id = ANY(%s)", (ids,))}
+    for finding in findings:
+        finding["statements"] = [by_id[i] for i in finding.pop("statement_ids")]
+
+    # Severity first, then confidence: a certain cosmetic issue stays below an uncertain costly one.
+    findings.sort(key=lambda f: (SEVERITY_ORDER.get(f["severity"], 3), -f["confidence"]))
+    return findings
+
+
 @app.post("/scan")
 def scan():
     """Compare what the documents say about each thing and record the contradictions."""
@@ -1152,7 +1173,6 @@ def scan():
         if not statements:
             return JSONResponse({"findings": [], "message": "No statements yet. Run Extract first."})
 
-        by_id = {s["statement_id"]: s for s in statements}
         groups = disagreeing_groups(statements)
         print(f"{len(groups)} group(s) of statements give different values")
 
@@ -1187,30 +1207,134 @@ def scan():
                      verdict.severity, min(max(verdict.confidence, 0.0), 1.0), verdict.explanation),
                 )
 
-        rows = conn.execute("""
-            SELECT finding_id, entity, attribute, statement_ids, category, severity, confidence,
-                   explanation, review_status, review_note
-            FROM findings
-        """).fetchall()
+        findings = load_findings(conn)
 
-    columns = ["finding_id", "entity", "attribute", "statement_ids", "category", "severity",
-               "confidence", "explanation", "review_status", "review_note"]
-    findings = []
-    for row in rows:
-        finding = dict(zip(columns, row))
-        # Each conflicting statement, quoted, with where it is in the pack.
+    # Each conflicting statement, quoted, with where it is in the pack.
+    for finding in findings:
         finding["statements"] = [
-            {"statement_id": by_id[i]["statement_id"], "doc": by_id[i]["doc"],
-             "page": by_id[i]["page"], "section": section_of(by_id[i]),
-             "quote": by_id[i]["quote"], "value": by_id[i]["normal_value"],
-             "status": by_id[i]["status"], "kind": by_id[i]["kind"]}
-            for i in finding.pop("statement_ids")
+            {"statement_id": s["statement_id"], "doc": s["doc"], "page": s["page"],
+             "section": section_of(s), "quote": s["quote"], "value": s["normal_value"],
+             "status": s["status"], "kind": s["kind"]}
+            for s in finding["statements"]
         ]
-        findings.append(finding)
-    # Severity first, then confidence: a certain cosmetic issue stays below an uncertain costly one.
-    findings.sort(key=lambda f: (SEVERITY_ORDER.get(f["severity"], 3), -f["confidence"]))
     print(f"{len(findings)} finding(s) stored")
     return JSONResponse({"findings": findings})
+
+
+# --------------------------------------------------------------------------
+# Upload and review pages
+# --------------------------------------------------------------------------
+
+def loader(request, step, next_url):
+    """The loader with the steps before `step` ticked off. As soon as it shows, it calls next_url."""
+    return templates.TemplateResponse(request, "loader.html", {"current": step, "next_url": next_url})
+
+
+@app.post("/steps/upload")
+async def upload_step(request: Request, files: list[UploadFile] = File(...)):
+    """Start from an empty database, so nothing from an earlier pack is compared."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        ensure_schema(conn)
+        conn.execute("DELETE FROM findings")
+        conn.execute("DELETE FROM chunks")
+    await uploads(files)
+    return loader(request, 1, "/steps/extract")
+
+
+@app.post("/steps/extract")
+def extract_step(request: Request):
+    extract()
+    return loader(request, 2, "/steps/supersede")
+
+
+@app.post("/steps/supersede")
+def supersede_step(request: Request):
+    supersede()
+    return loader(request, 3, "/steps/scan")
+
+
+@app.post("/steps/scan")
+def scan_step():
+    scan()
+    # htmx sees this header and opens the first finding.
+    return Response(headers={"HX-Redirect": "/review/1"})
+
+
+def table_header(statement):
+    """The header row of the table a statement was quoted from, or '' if it was not a table."""
+    first_row = statement["quote"].split(" ... ")[0]  # worked out facts quote 'row ... row'
+    header = ""
+    for line in statement["section_content"].split("\n"):
+        if " | " not in line:
+            header = ""  # text between tables ends a table
+            continue
+        if not header:
+            header = line
+        if quote_matches(first_row, line):
+            return header
+    return ""
+
+
+def still_binding(statement):
+    return statement["status"] == "active" and statement["kind"] != "information"
+
+
+def sides(statements):
+    """Split a finding in two sides to compare. Side A is the value given by the most
+    statements that still apply; side B is everything that gives another value."""
+    by_value = {}
+    for statement in statements:
+        by_value.setdefault(statement["normal_value"], []).append(statement)
+    side_a = max(by_value.values(), key=lambda group: sum(still_binding(s) for s in group))
+    side_b = [s for s in statements if s["normal_value"] != side_a[0]["normal_value"]]
+    return side_a, side_b
+
+
+def side_values(side):
+    """The values a side gives, e.g. '6 dogs / 8 dogs'."""
+    return " / ".join(dict.fromkeys(s["normal_value"] or "(none)" for s in side))
+
+
+@app.get("/review/{number}")
+def review(request: Request, number: int):
+    """Show one finding, its two sides next to each other. Findings count from 1."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        ensure_schema(conn)
+        findings = load_findings(conn)
+
+    if not 1 <= number <= len(findings):
+        statuses = [f["review_status"] for f in findings]
+        return templates.TemplateResponse(request, "done.html", {
+            "total": len(findings),
+            "confirmed": statuses.count("confirmed"),
+            "dismissed": statuses.count("dismissed"),
+            "unreviewed": statuses.count("unreviewed"),
+        })
+
+    finding = findings[number - 1]
+    for statement in finding["statements"]:
+        statement["section"] = section_of(statement)
+        statement["table"] = table_header(statement)
+    side_a, side_b = sides(finding["statements"])
+    return templates.TemplateResponse(request, "review.html", {
+        "finding": finding,
+        "number": number,
+        "total": len(findings),
+        "side_a": side_a,
+        "side_b": side_b,
+        "values_a": side_values(side_a),
+        "values_b": side_values(side_b),
+    })
+
+
+@app.post("/review/{number}")
+def decide(number: int, finding_id: str = Form(...),
+           decision: Literal["confirmed", "dismissed"] = Form(...)):
+    """Store the reviewer's decision, then show the next finding."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        conn.execute("UPDATE findings SET review_status = %s WHERE finding_id = %s",
+                     (decision, finding_id))
+    return RedirectResponse(f"/review/{number + 1}", status_code=303)
 
 
 if __name__ == "__main__":

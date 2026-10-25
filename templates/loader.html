@@ -1,0 +1,25 @@
+{% set steps = ["Reading the PDFs", "Extracting statements", "Applying addenda", "Finding contradictions"] %}
+<div class="w-72">
+  <p class="font-medium text-white">Reading the tender pack</p>
+  <p class="mt-1 text-sm text-neutral-500">This takes a few minutes.</p>
+  <ol class="mt-6 space-y-3 text-sm">
+    {% for step in steps %}
+      {% if loop.index0 < current %}
+      <li class="flex items-center gap-3 text-neutral-400">
+        <span class="flex size-4 items-center justify-center text-emerald-400">✓</span>{{ step }}
+      </li>
+      {% elif loop.index0 == current %}
+      <li class="flex items-center gap-3 text-white">
+        <span class="size-4 animate-spin rounded-full border-2 border-neutral-700 border-t-white"></span>{{ step }}
+      </li>
+      {% else %}
+      <li class="flex items-center gap-3 text-neutral-600">
+        <span class="size-4 rounded-full border-2 border-neutral-800"></span>{{ step }}
+      </li>
+      {% endif %}
+    {% endfor %}
+  </ol>
+  {% if next_url %}
+  <div hx-post="{{ next_url }}" hx-trigger="load" hx-target="#app"></div>
+  {% endif %}
+</div>

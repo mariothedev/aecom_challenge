@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en" style="color-scheme: dark">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Tender contradiction detection</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.1.11"></script>
+    <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js"></script>
+    <style>
+      /* While the upload runs, htmx adds .htmx-request to the form: hide the button, show the loader. */
+      .loading { display: none; }
+      .htmx-request .loading { display: block; }
+      .htmx-request .idle { display: none; }
+    </style>
+  </head>
+  <body class="min-h-screen bg-neutral-950 text-neutral-300 antialiased">
+    {% block content %}{% endblock %}
+  </body>
+</html>

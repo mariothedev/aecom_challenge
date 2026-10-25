@@ -1,28 +1,23 @@
-<!doctype html>
-<html>
-  <head>
-    <title>Tender contradiction detection</title>
-  </head>
-  <body>
-    <h1>Upload tender pack</h1>
-    <form action="/uploads" method="post" enctype="multipart/form-data">
-      <input type="file" name="files" accept="application/pdf" multiple>
-      <button type="submit">Upload</button>
-    </form>
+{% extends "base.html" %}
+{% block content %}
+<main id="app" class="flex min-h-screen items-center justify-center p-4"
+      hx-on::response-error="this.innerHTML = document.getElementById('failed').innerHTML">
+  <form hx-post="/steps/upload" hx-encoding="multipart/form-data" hx-trigger="change" hx-target="#app">
+    <label class="idle inline-block cursor-pointer rounded-lg bg-white px-8 py-3 font-medium text-neutral-950 transition hover:bg-neutral-200 focus-within:ring-2 focus-within:ring-white/50 focus-within:ring-offset-4 focus-within:ring-offset-neutral-950">
+      Upload files
+      <input type="file" name="files" accept="application/pdf" multiple class="sr-only">
+    </label>
+    <div class="loading">
+      {% with current = 0 %}{% include "loader.html" %}{% endwith %}
+    </div>
+  </form>
+</main>
 
-    <h1>Extract statements</h1>
-    <form action="/extract" method="post">
-      <button type="submit">Extract</button>
-    </form>
-
-    <h1>Apply addenda</h1>
-    <form action="/supersede" method="post">
-      <button type="submit">Supersede</button>
-    </form>
-
-    <h1>Scan for contradictions</h1>
-    <form action="/scan" method="post">
-      <button type="submit">Scan</button>
-    </form>
-  </body>
-</html>
+<template id="failed">
+  <div class="text-center">
+    <p class="font-medium text-white">Something went wrong while reading the pack.</p>
+    <p class="mt-1 text-sm text-neutral-500">The server log says what failed.</p>
+    <a href="/" class="mt-6 inline-block rounded-lg bg-white px-6 py-2.5 font-medium text-neutral-950 hover:bg-neutral-200">Try again</a>
+  </div>
+</template>
+{% endblock %}
