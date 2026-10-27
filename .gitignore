@@ -12,3 +12,6 @@ venv/
 
 # Markdown written by the app
 markdown/
+
+# Google service account key
+google-key.json
