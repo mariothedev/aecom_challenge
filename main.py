@@ -18,8 +18,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 import numpy as np
-import umap
-from sklearn.cluster import HDBSCAN
+# No longer used: nearest-neighbour pairs replaced UMAP + HDBSCAN (importing umap alone took ~8 seconds)
+# import umap
+# from sklearn.cluster import HDBSCAN
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -60,8 +61,21 @@ Reply with JSON in this shape:
 
 Write one statement per fact. A cover page or a table of contents has no statements."""
 
-CONTRADICTION_PROMPT = """You get statements from tender documents that are about the same topic.
-Find pairs that contradict each other: they cannot both be true, for example different values,
+# Old prompt: the LLM got one cluster of statements and had to find the contradicting pairs itself.
+# CONTRADICTION_PROMPT = """You get statements from tender documents that are about the same topic.
+# Find pairs that contradict each other: they cannot both be true, for example different values,
+# dates, ratings or quantities for the same thing, or opposite rules.
+# Statements that only add detail, or are about different items, are not contradictions.
+# If an addendum or query response changes an earlier statement, list the pair and say so in the reason.
+#
+# Reply with JSON in this shape:
+# {"contradictions": [{"a": 12, "b": 47, "reason": "..."}]}
+#
+# Use the statement ids in square brackets. Reply {"contradictions": []} if there are none."""
+
+# New prompt: the LLM gets numbered pairs and only says which pairs contradict. Same rules as before.
+PAIRS_PROMPT = """You get numbered pairs of statements from tender documents. The two statements in a pair are about similar topics.
+For each pair, decide if the two statements contradict each other: they cannot both be true, for example different values,
 dates, ratings or quantities for the same thing, or opposite rules.
 Statements that only add detail, or are about different items, are not contradictions.
 If an addendum or query response changes an earlier statement, list the pair and say so in the reason.
@@ -70,8 +84,19 @@ Reply with JSON in this shape:
 {"contradictions": [{"a": 12, "b": 47, "reason": "..."}]}
 
 Use the statement ids in square brackets. Reply {"contradictions": []} if there are none."""
+# First try asked for pair numbers ({"pair": 3, ...}), but the LLM sometimes mixed up pairs
+# ("Pair 22 says ... but Pair 27 says ...") and the finding was stored on the wrong statements.
+# Statement ids say exactly which two statements contradict.
+# {"contradictions": [{"pair": 3, "reason": "..."}]}
+#
+# Use the pair numbers. Reply {"contradictions": []} if there are none."""
 
-llm_slots = asyncio.Semaphore(10)  # at most 10 cluster checks at once
+NEIGHBOURS = 5  # each statement is checked against its 5 most similar statements
+MIN_SIMILARITY = 0.6  # less similar than this (cosine) and two statements are about different things
+PAIRS_PER_CALL = 30  # how many pairs the LLM checks in one call
+
+# llm_slots = asyncio.Semaphore(10)  # at most 10 cluster checks at once
+llm_slots = asyncio.Semaphore(10)  # at most 10 LLM calls checking pairs at once
 
 
 llm = ChatOpenAI(model=CHAT_MODEL, base_url=DEEPINFRA_URL, api_key=DEEPINFRA_API_KEY, temperature=0)
@@ -253,96 +278,191 @@ async def ingest(document, pdf_bytes):
     return len(statements)
 
 
-def cluster_vectors(vectors):
-    """One cluster number per vector; -1 means it fits no cluster."""
-    if len(vectors) < 3:
-        return [-1] * len(vectors)
-    if len(vectors) > 20:  # UMAP needs a reasonable number of points
-        vectors = umap.UMAP(
-            n_components=10,
-            n_neighbors=min(15, len(vectors) - 1),
-            metric="cosine",
-            random_state=42,
-        ).fit_transform(vectors)
-    return HDBSCAN(min_cluster_size=2).fit_predict(vectors).tolist()
+# Old: UMAP + HDBSCAN put the statements into clusters, then one LLM call checked each cluster.
+# Statements HDBSCAN marked as noise (-1) were never checked, and UMAP took ~10 seconds to compile
+# on its first run. Replaced by the nearest-neighbour pairs below.
+#
+# def cluster_vectors(vectors):
+#     """One cluster number per vector; -1 means it fits no cluster."""
+#     if len(vectors) < 3:
+#         return [-1] * len(vectors)
+#     if len(vectors) > 20:  # UMAP needs a reasonable number of points
+#         vectors = umap.UMAP(
+#             n_components=10,
+#             n_neighbors=min(15, len(vectors) - 1),
+#             metric="cosine",
+#             random_state=42,
+#         ).fit_transform(vectors)
+#     return HDBSCAN(min_cluster_size=2).fit_predict(vectors).tolist()
 
 
-async def cluster_statements():
-    async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
-        cur = await conn.execute("SELECT id, embedding::text FROM statements ORDER BY id")
-        rows = await cur.fetchall()
-        if not rows:
-            return 0
+# async def cluster_statements():
+#     async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+#         cur = await conn.execute("SELECT id, embedding::text FROM statements ORDER BY id")
+#         rows = await cur.fetchall()
+#         if not rows:
+#             return 0
 
-        ids = [row[0] for row in rows]
-        vectors = np.array([json.loads(row[1]) for row in rows], dtype=np.float32)
+#         ids = [row[0] for row in rows]
+#         vectors = np.array([json.loads(row[1]) for row in rows], dtype=np.float32)
 
-        # UMAP and HDBSCAN are CPU-heavy, so keep them off the event loop
-        labels = await asyncio.to_thread(cluster_vectors, vectors)
+#         # UMAP and HDBSCAN are CPU-heavy, so keep them off the event loop
+#         labels = await asyncio.to_thread(cluster_vectors, vectors)
 
-        async with conn.cursor() as cur:
-            await cur.executemany(
-                "UPDATE statements SET cluster_id = %s WHERE id = %s",
-                list(zip(labels, ids)),
-            )
-    return len(set(labels) - {-1})
+#         async with conn.cursor() as cur:
+#             await cur.executemany(
+#                 "UPDATE statements SET cluster_id = %s WHERE id = %s",
+#                 list(zip(labels, ids)),
+#             )
+#     return len(set(labels) - {-1})
 
 
-async def check_cluster(statements):
-    """Contradicting (id_a, id_b, reason) pairs within one cluster."""
-    lines = "\n".join(
-        f"[{id}] ({document}, page {page}) {entity}: {text}"
-        for id, document, page, entity, text in statements
-    )
+# async def check_cluster(statements):
+#     """Contradicting (id_a, id_b, reason) pairs within one cluster."""
+#     lines = "\n".join(
+#         f"[{id}] ({document}, page {page}) {entity}: {text}"
+#         for id, document, page, entity, text in statements
+#     )
+#     async with llm_slots:
+#         reply = await json_llm.ainvoke([SystemMessage(CONTRADICTION_PROMPT), HumanMessage(lines)])
+
+#     ids = {s[0] for s in statements}
+#     pairs = []
+#     for c in json.loads(reply.content).get("contradictions", []):
+#         try:
+#             a, b = int(c["a"]), int(c["b"])
+#         except (KeyError, TypeError, ValueError):
+#             continue
+#         if a in ids and b in ids and a != b:  # ignore ids the LLM made up
+#             pairs.append((a, b, c.get("reason")))
+#     return pairs
+
+
+# async def find_contradictions():
+#     """Send each cluster to the LLM and replace the contradictions table with the result."""
+#     async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+#         cur = await conn.execute(
+#             """SELECT cluster_id, id, document, page, entity, text
+#                FROM statements WHERE cluster_id <> -1
+#                ORDER BY cluster_id, id"""
+#         )
+#         rows = await cur.fetchall()
+
+#     clusters = {}
+#     for cluster_id, *statement in rows:
+#         clusters.setdefault(cluster_id, []).append(statement)
+
+#     results = await asyncio.gather(*[check_cluster(s) for s in clusters.values()])
+#     pairs = [pair for result in results for pair in result]
+
+#     statements_by_id = {row[1]: row[2:] for row in rows}
+#     print(f"Found {len(pairs)} contradiction(s)")
+#     # for a, b, reason in pairs[:2]:
+#     #     print("--- Contradiction ---")
+#     #     for statement_id in (a, b):
+#     #         document, page, entity, text = statements_by_id[statement_id]
+#     #         print(f"[{statement_id}] {document}, page {page} | {entity}: {text}")
+#     #     print(f"Reason: {reason}")
+
+#     async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+#         await conn.execute("DELETE FROM contradictions")
+#         async with conn.cursor() as cur:
+#             await cur.executemany(
+#                 "INSERT INTO contradictions (statement_a, statement_b, reason) VALUES (%s, %s, %s)",
+#                 pairs,
+#             )
+#     return len(pairs)
+
+
+# New: nearest-neighbour pairs.
+# A contradiction is always between two statements, and those two statements are about the same thing,
+# so their embeddings are close. For every statement we take its few closest statements and ask the LLM
+# about each pair. Every statement gets checked (nothing is left out as noise), and it takes milliseconds.
+
+def find_candidate_pairs(ids, vectors):
+    """Pairs of statement ids worth checking: every statement with its most similar statements."""
+    if len(ids) < 2:
+        return []
+    vectors = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)  # length 1, so a dot product is the cosine similarity
+    similarity = vectors @ vectors.T  # similarity[i, j]: how close statements i and j are (1 = same meaning)
+    np.fill_diagonal(similarity, -1)  # a statement is not its own neighbour
+
+    pairs = set()
+    for i in range(len(ids)):
+        closest = np.argsort(similarity[i])[::-1][:NEIGHBOURS]
+        for j in closest:
+            if similarity[i, j] >= MIN_SIMILARITY:
+                pairs.add((min(ids[i], ids[j]), max(ids[i], ids[j])))  # (a, b) and (b, a) are the same pair
+    return sorted(pairs)  # sorted by id, so pairs that share a statement end up in the same LLM call
+
+
+async def check_pairs(pairs, statements_by_id):
+    """The pairs in this batch that contradict, as (id_a, id_b, reason)."""
+    lines = []
+    for number, (a, b) in enumerate(pairs, start=1):
+        lines.append(f"Pair {number}")
+        for statement_id in (a, b):
+            document, page, entity, text = statements_by_id[statement_id]
+            # lines.append(f"- ({document}, page {page}) {entity}: {text}")
+            lines.append(f"- [{statement_id}] ({document}, page {page}) {entity}: {text}")
     async with llm_slots:
-        reply = await json_llm.ainvoke([SystemMessage(CONTRADICTION_PROMPT), HumanMessage(lines)])
+        reply = await json_llm.ainvoke([SystemMessage(PAIRS_PROMPT), HumanMessage("\n".join(lines))])
 
-    ids = {s[0] for s in statements}
-    pairs = []
+    # found = []
+    # for c in json.loads(reply.content).get("contradictions", []):
+    #     try:
+    #         number = int(c["pair"])
+    #     except (KeyError, TypeError, ValueError):
+    #         continue
+    #     if 1 <= number <= len(pairs):  # ignore pair numbers the LLM made up
+    #         a, b = pairs[number - 1]
+    #         found.append((a, b, c.get("reason")))
+    # return found
+
+    ids = {statement_id for pair in pairs for statement_id in pair}
+    found = []
     for c in json.loads(reply.content).get("contradictions", []):
         try:
             a, b = int(c["a"]), int(c["b"])
         except (KeyError, TypeError, ValueError):
             continue
         if a in ids and b in ids and a != b:  # ignore ids the LLM made up
-            pairs.append((a, b, c.get("reason")))
-    return pairs
+            found.append((a, b, c.get("reason")))
+    return found
 
 
 async def find_contradictions():
-    """Send each cluster to the LLM and replace the contradictions table with the result."""
+    """Check every statement against its closest statements and replace the contradictions table with the result."""
+    # One connection for the whole step: connecting to the database takes about a second
     async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
-        cur = await conn.execute(
-            """SELECT cluster_id, id, document, page, entity, text
-               FROM statements WHERE cluster_id <> -1
-               ORDER BY cluster_id, id"""
-        )
+        cur = await conn.execute("SELECT id, document, page, entity, text, embedding::text FROM statements ORDER BY id")
         rows = await cur.fetchall()
+        ids = [row[0] for row in rows]
+        vectors = np.array([json.loads(row[5]) for row in rows], dtype=np.float32)
+        statements_by_id = {row[0]: row[1:5] for row in rows}
 
-    clusters = {}
-    for cluster_id, *statement in rows:
-        clusters.setdefault(cluster_id, []).append(statement)
+        start = perf_counter()
+        pairs = find_candidate_pairs(ids, vectors)
+        print(f"candidate pairs: {len(pairs)} in {perf_counter() - start:.3f} seconds")
 
-    results = await asyncio.gather(*[check_cluster(s) for s in clusters.values()])
-    pairs = [pair for result in results for pair in result]
+        # Many pairs per LLM call, all calls at once
+        batches = [pairs[i:i + PAIRS_PER_CALL] for i in range(0, len(pairs), PAIRS_PER_CALL)]
+        results = await asyncio.gather(*[check_pairs(batch, statements_by_id) for batch in batches])
+        # contradictions = [pair for result in results for pair in result]
+        # A statement can be in more than one LLM call, so the same pair can come back twice: keep it once
+        unique = {}
+        for a, b, reason in [pair for result in results for pair in result]:
+            unique.setdefault((min(a, b), max(a, b)), reason)
+        contradictions = [(a, b, reason) for (a, b), reason in unique.items()]
+        print(f"Found {len(contradictions)} contradiction(s) in {len(batches)} LLM calls")
 
-    statements_by_id = {row[1]: row[2:] for row in rows}
-    print(f"Found {len(pairs)} contradiction(s)")
-    # for a, b, reason in pairs[:2]:
-    #     print("--- Contradiction ---")
-    #     for statement_id in (a, b):
-    #         document, page, entity, text = statements_by_id[statement_id]
-    #         print(f"[{statement_id}] {document}, page {page} | {entity}: {text}")
-    #     print(f"Reason: {reason}")
-
-    async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
         await conn.execute("DELETE FROM contradictions")
         async with conn.cursor() as cur:
             await cur.executemany(
                 "INSERT INTO contradictions (statement_a, statement_b, reason) VALUES (%s, %s, %s)",
-                pairs,
+                contradictions,
             )
-    return len(pairs)
+    return len(contradictions)
 
 
 @app.on_event("startup")
@@ -371,12 +491,13 @@ async def upload(files: list[UploadFile]):
     counts = await asyncio.gather(*[ingest(name, pdf_bytes) for name, pdf_bytes in pdfs])
     print(f"ingest: {perf_counter() - start:.3f} seconds")
 
-    # Takes all statements from the db and cluster them, grouped by similarity using their embeddings
-    start = perf_counter()
-    clusters = await cluster_statements()
-    print(f"clustering: {perf_counter() - start:.3f} seconds")
+    # No clustering step any more: find_contradictions() picks the pairs to check by itself
+    # # Takes all statements from the db and cluster them, grouped by similarity using their embeddings
+    # start = perf_counter()
+    # clusters = await cluster_statements()
+    # print(f"clustering: {perf_counter() - start:.3f} seconds")
 
-    # Sends each cluster to the LLM and stores the contradicting pairs
+    # Pairs every statement with its closest statements, asks the LLM about each pair, stores the contradictions
     start = perf_counter()
     contradictions = await find_contradictions()
     print(f"contradiction detection: {perf_counter() - start:.3f} seconds")
@@ -384,7 +505,8 @@ async def upload(files: list[UploadFile]):
     # print(f"ingest + clustering: {perf_counter() - start:.3f} seconds")
     print(f"total: {perf_counter() - total_start:.3f} seconds")
 
-    return f"Stored {sum(counts)} statements from {len(pdfs)} files in {clusters} clusters."
+    # return f"Stored {sum(counts)} statements from {len(pdfs)} files in {clusters} clusters."
+    return f"Stored {sum(counts)} statements from {len(pdfs)} files and found {contradictions} contradiction(s)."
 
 
 if __name__ == "__main__":
