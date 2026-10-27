@@ -151,6 +151,19 @@ async def extract_statements(page):
     return json.loads(reply.content)["statements"]
 
 
+async def extract_and_embed(page, number):
+    """The statements on one page and their embedding vectors.
+
+    The page embeds its own statements as soon as its LLM extraction is done.
+    So while the slowest page is still with the LLM, the faster pages are already embedded."""
+    statements = await extract_statements(page)
+    statements = [statement | {"page": number} for statement in statements]
+    if not statements:  # a cover page or table of contents has nothing to embed
+        return [], []
+    vectors = await embedder.aembed_documents([f"{s.get('entity')}: {s.get('text')}" for s in statements])
+    return statements, vectors
+
+
 async def create_table():
     async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
         await conn.execute(f"""
@@ -207,21 +220,34 @@ async def ingest(document, pdf_bytes):
     MARKDOWN_DIR.mkdir(exist_ok=True)
     (MARKDOWN_DIR / f"{Path(document).stem}.md").write_text(markdown)
 
-    # Give one markdown page to the LLM at a time
-    extraction_start = perf_counter()
-    statements_per_page = await asyncio.gather(*[extract_statements(page) for page in pages])
-    extraction_seconds = perf_counter() - extraction_start
-    statements = []
-    for number, page_statements in enumerate(statements_per_page, start=1):
-        for statement in page_statements:
-            statements.append(statement | {"page": number})
+    # Before: extract every page, wait for ALL pages, then embed everything in one call.
+    # The embedding call could only start after the slowest page was done, so its time was added on top.
+    #
+    # # Give one markdown page to the LLM at a time
+    # extraction_start = perf_counter()
+    # statements_per_page = await asyncio.gather(*[extract_statements(page) for page in pages])
+    # extraction_seconds = perf_counter() - extraction_start
+    # statements = []
+    # for number, page_statements in enumerate(statements_per_page, start=1):
+    #     for statement in page_statements:
+    #         statements.append(statement | {"page": number})
+    #
+    # print(f"LLM extraction [{document}]: {len(statements)} statements in {extraction_seconds:.3f} seconds")
+    #
+    # # return one embedding vector per statement
+    # start = perf_counter()
+    # vectors = await embedder.aembed_documents([f"{s.get('entity')}: {s.get('text')}" for s in statements])
+    # print(f"Embeddings [{document}]: {perf_counter() - start:.3f} seconds")
 
-    print(f"LLM extraction [{document}]: {len(statements)} statements in {extraction_seconds:.3f} seconds")
-
-    # return one embedding vector per statement
+    # Now: every page is extracted AND embedded in its own task, all pages at once.
+    # Embedding time hides behind the slowest page's LLM call instead of adding to the total.
+    # Trade-off: one embedding request per page instead of one per PDF (fine for DeepInfra, but more requests).
     start = perf_counter()
-    vectors = await embedder.aembed_documents([f"{s.get('entity')}: {s.get('text')}" for s in statements])
-    print(f"Embeddings [{document}]: {perf_counter() - start:.3f} seconds")
+    results = await asyncio.gather(*[extract_and_embed(page, number) for number, page in enumerate(pages, start=1)])
+    statements = [statement for page_statements, _ in results for statement in page_statements]
+    vectors = [vector for _, page_vectors in results for vector in page_vectors]
+    print(f"LLM extraction + embeddings [{document}]: {len(statements)} statements in {perf_counter() - start:.3f} seconds")
+
     await save_statements(document, statements, vectors)
     print(f"{document}: {len(statements)} statements")
     return len(statements)
@@ -322,6 +348,10 @@ async def find_contradictions():
 @app.on_event("startup")
 async def startup():
     await create_table()
+    # Warm up: the first embedding call is slow (setting up the HTTPS connection, DeepInfra waking the model).
+    # Doing it here keeps that cost out of the first upload.
+    # Note: if the server sits idle for a long time, DeepInfra can put the model to sleep again.
+    await embedder.aembed_query("warm up")
 
 
 @app.get("/")
