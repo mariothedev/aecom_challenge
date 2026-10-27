@@ -12,8 +12,9 @@ from anyio import fail_after
 import psycopg
 import pymupdf
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.templating import Jinja2Templates
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
@@ -31,7 +32,7 @@ load_dotenv(BASE_DIR / ".env", override=True)
 DATABASE_URL = os.environ["DATABASE_URL"]
 DEEPINFRA_API_KEY = os.environ["DEEPINFRA_API_KEY"]
 DEEPINFRA_URL = "https://api.deepinfra.com/v1/openai"
-LITEPARSE_URL = "https://docling.mariothedev.com/parse"
+LITEPARSE_URL = "https://liteparse.mariothedev.com/parse"
 LITEPARSE_CONFIG = {"ocrEnabled": False, "outputFormat": "markdown"}  # OCR is off: it is slow and text PDFs don't need it
 
 CHAT_MODEL = "zai-org/GLM-5.3-Flash"
@@ -106,6 +107,7 @@ embedder = OpenAIEmbeddings(model=EMBEDDING_MODEL, base_url=DEEPINFRA_URL, api_k
                             check_embedding_ctx_length=False)
 
 app = FastAPI(title="Tender statements")
+templates = Jinja2Templates(directory=BASE_DIR / "templates")  # Jinja escapes the PDF text, so it is safe to show
 
 
 # def convert_pdf_to_png(pdf_bytes):
@@ -236,7 +238,8 @@ async def ingest(document, pdf_bytes):
 
     # LiteParse reads the PDF's text layer and gives back the markdown of each page
     start = perf_counter()
-    pages = await get_markdown_from_pdf_llamaparse(document, pdf_bytes)
+    pages = await get_markdown_from_pdf_hetzner(document, pdf_bytes)
+    # pages = await get_markdown_from_pdf_llamaparse(document, pdf_bytes)
     print(f"LiteParse [{document}]: {perf_counter() - start:.3f} seconds")
 
     # Combine all pages into one markdown string per PDF
@@ -465,6 +468,37 @@ async def find_contradictions():
     return len(contradictions)
 
 
+async def load_contradictions():
+    """Every stored contradiction with both of its statements, for the page."""
+    async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+        cur = await conn.execute("""
+            SELECT c.reason,
+                   a.document, a.page, a.section, a.entity, a.kind, a.text,
+                   b.document, b.page, b.section, b.entity, b.kind, b.text
+            FROM contradictions c
+            JOIN statements a ON a.id = c.statement_a
+            JOIN statements b ON b.id = c.statement_b""")
+        rows = await cur.fetchall()
+
+    columns = ["document", "page", "section", "entity", "kind", "text"]
+    contradictions = []
+    for reason, *values in rows:
+        a = dict(zip(columns, values[:6]))
+        b = dict(zip(columns, values[6:]))
+        if (b["document"], b["page"]) < (a["document"], a["page"]):  # the earlier document goes on the left
+            a, b = b, a
+        contradictions.append({"reason": reason, "a": a, "b": b})
+    contradictions.sort(key=lambda c: (c["a"]["document"], c["a"]["page"], c["b"]["document"], c["b"]["page"]))
+    return contradictions
+
+
+async def load_documents():
+    """The names of the PDFs in the database. Empty means nothing is uploaded yet."""
+    async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+        cur = await conn.execute("SELECT DISTINCT document FROM statements ORDER BY document")
+        return [row[0] for row in await cur.fetchall()]
+
+
 @app.on_event("startup")
 async def startup():
     await create_table()
@@ -474,13 +508,38 @@ async def startup():
     await embedder.aembed_query("warm up")
 
 
-@app.get("/")
-def index():
-    return FileResponse(BASE_DIR / "templates" / "index.html")
+# @app.get("/")
+# def index():
+#     return FileResponse(BASE_DIR / "templates" / "index.html")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    """Nothing uploaded: the Upload button. PDFs uploaded before: the Reset button and their contradictions."""
+    # Both queries at the same time: each one needs its own trip to the database
+    documents, contradictions = await asyncio.gather(load_documents(), load_contradictions())
+    return templates.TemplateResponse(request, "index.html", {"documents": documents, "contradictions": contradictions})
+
+
+@app.post("/reset", response_class=HTMLResponse)
+async def reset(request: Request):
+    """Wipe the uploaded PDFs from the database, so a new set of PDFs can be uploaded."""
+    async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+        await conn.execute("DELETE FROM contradictions")
+        await conn.execute("DELETE FROM statements")
+    print("reset: database wiped")
+    return templates.TemplateResponse(request, "contradictions.html", {"documents": [], "contradictions": []})
+
+
+# No longer used: the page only shows contradictions after an upload, not the stored ones when it opens.
+# @app.get("/contradictions", response_class=HTMLResponse)
+# async def contradictions(request: Request):
+#     """The stored contradictions, side by side. The page loads this when it opens."""
+#     return templates.TemplateResponse(request, "contradictions.html", {"contradictions": await load_contradictions()})
 
 
 @app.post("/upload", response_class=HTMLResponse)
-async def upload(files: list[UploadFile]):
+async def upload(request: Request, files: list[UploadFile]):
     total_start = perf_counter()
     start = perf_counter()
     pdfs = [(file.filename, await file.read()) for file in files]
@@ -506,7 +565,16 @@ async def upload(files: list[UploadFile]):
     print(f"total: {perf_counter() - total_start:.3f} seconds")
 
     # return f"Stored {sum(counts)} statements from {len(pdfs)} files in {clusters} clusters."
-    return f"Stored {sum(counts)} statements from {len(pdfs)} files and found {contradictions} contradiction(s)."
+    # return f"Stored {sum(counts)} statements from {len(pdfs)} files and found {contradictions} contradiction(s)."
+    # Show the summary and the contradictions, side by side
+    message = f"Stored {sum(counts)} statements from {len(pdfs)} files and found {contradictions} contradiction(s)."
+    documents, found = await asyncio.gather(load_documents(), load_contradictions())
+    return templates.TemplateResponse(request, "contradictions.html", {
+        "message": message,
+        "documents": documents,  # not empty any more, so the page shows the Reset button instead of Upload
+        # "contradictions": await load_contradictions(),
+        "contradictions": found,
+    })
 
 
 if __name__ == "__main__":

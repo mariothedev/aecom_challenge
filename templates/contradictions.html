@@ -1,0 +1,73 @@
+<!-- What the page shows. Used by / (when the page opens), /upload and /reset.
+     No PDFs in the database: the Upload button.
+     PDFs uploaded: the Reset button and the contradictions, each with its two statements side by side. -->
+{% if not documents %}
+<form class="flex flex-col items-center"
+      hx-post="/upload" hx-encoding="multipart/form-data" hx-trigger="change" hx-target="#page"
+      hx-on::after-request="this.reset()"
+      hx-on::response-error="this.querySelector('.error').textContent = 'Upload failed. The server log says why.'">
+  <label class="idle inline-block cursor-pointer rounded-lg bg-white px-8 py-3 font-medium text-neutral-950 transition hover:bg-neutral-200">
+    Upload
+    <input type="file" name="files" accept="application/pdf" multiple class="hidden">
+  </label>
+  <div class="uploading items-center gap-3 text-white">
+    <span class="size-4 animate-spin rounded-full border-2 border-neutral-700 border-t-white"></span>
+    Uploading…
+  </div>
+  <p class="error mt-6 text-sm text-red-400"></p>
+</form>
+{% else %}
+
+{# {% if message %}
+<p class="text-center text-sm text-neutral-400">{{ message }}</p>
+{% endif %} #}
+<div class="flex flex-wrap items-center justify-between gap-4">
+  <div class="min-w-0 text-sm">
+    {% if message %}
+    <p class="text-neutral-300">{{ message }}</p>
+    {% endif %}
+    <p class="break-words text-neutral-500">{{ documents | length }} PDF(s): {{ documents | join(", ") }}</p>
+  </div>
+  <!-- Wipes these PDFs from the database, so a new set can be uploaded -->
+  <button class="rounded-lg border border-neutral-700 px-6 py-2.5 font-medium text-white transition hover:bg-neutral-800"
+          hx-post="/reset" hx-target="#page"
+          hx-confirm="Delete these PDFs and their contradictions, so you can upload a new set?">
+    Reset
+  </button>
+</div>
+
+{% if contradictions %}
+<h2 class="mt-10 text-lg font-semibold text-white">{{ contradictions | length }} contradiction(s)</h2>
+<ul class="mt-4 space-y-6">
+  {% for c in contradictions %}
+  <li class="overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900">
+    <p class="p-4 text-sm leading-relaxed text-neutral-300">{{ c.reason }}</p>
+
+    <!-- Two columns on a wide screen, one under the other on a phone -->
+    <div class="grid border-t border-neutral-800 md:grid-cols-2">
+      {% for side in [c.a, c.b] %}
+      <div class="min-w-0 p-4 {{ 'border-t border-neutral-800 md:border-t-0 md:border-l' if loop.last }}">
+        <div class="flex flex-wrap items-center gap-2 text-xs text-neutral-500">
+          <span class="break-all text-neutral-300">{{ side.document }}</span>
+          <span>· page {{ side.page }}</span>
+          {% if side.kind %}
+          <span class="rounded px-1.5 py-0.5 {{ 'bg-amber-400/10 text-amber-300' if side.kind == 'amendment' else 'bg-neutral-800 text-neutral-400' }}">{{ side.kind }}</span>
+          {% endif %}
+        </div>
+        {% if side.section %}
+        <p class="mt-2 break-words text-sm font-medium text-white">{{ side.section }}</p>
+        {% endif %}
+        <p class="mt-0.5 break-words text-xs text-neutral-500">{{ side.entity }}</p>
+        <blockquote class="mt-3 break-words border-l-2 border-neutral-700 pl-3 text-neutral-100">“{{ side.text }}”</blockquote>
+      </div>
+      {% endfor %}
+    </div>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<!-- <p class="mt-6 text-center text-sm text-neutral-500">No contradictions found yet.</p> -->
+<p class="mt-10 text-center text-sm text-neutral-500">No contradictions found in these PDFs.</p>
+{% endif %}
+
+{% endif %}

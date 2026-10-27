@@ -10,23 +10,40 @@
       /* While the upload runs, htmx adds .htmx-request to the form: hide the button, show "Uploading". */
       .uploading { display: none; }
       .htmx-request .uploading { display: flex; }
-      .htmx-request .idle, .htmx-request #result { display: none; }
+      /* .htmx-request .idle, .htmx-request #result { display: none; } */
+      /* .htmx-request .idle, .htmx-request ~ #result { display: none; } */
+      .htmx-request .idle { display: none; }
     </style>
   </head>
-  <body class="flex min-h-screen items-center justify-center bg-neutral-950 p-4 text-neutral-300 antialiased">
-    <form class="text-center"
-          hx-post="/upload" hx-encoding="multipart/form-data" hx-trigger="change" hx-target="#result"
-          hx-on::after-request="this.reset()"
-          hx-on::response-error="document.getElementById('result').textContent = 'Upload failed. The server log says why.'">
-      <label class="idle inline-block cursor-pointer rounded-lg bg-white px-8 py-3 font-medium text-neutral-950 transition hover:bg-neutral-200">
-        Upload
-        <input type="file" name="files" accept="application/pdf" multiple class="hidden">
-      </label>
-      <div class="uploading items-center gap-3 text-white">
-        <span class="size-4 animate-spin rounded-full border-2 border-neutral-700 border-t-white"></span>
-        Uploading…
-      </div>
-      <p id="result" class="mt-6 text-sm text-neutral-400"></p>
-    </form>
+  {# Old page: the Upload button was always here, and the contradictions went into #result below it.
+  <!-- <body class="flex min-h-screen items-center justify-center bg-neutral-950 p-4 text-neutral-300 antialiased"> -->
+  <body class="min-h-screen bg-neutral-950 p-4 text-neutral-300 antialiased">
+    <main class="mx-auto max-w-6xl py-8">
+      <form class="flex justify-center"
+            hx-post="/upload" hx-encoding="multipart/form-data" hx-trigger="change" hx-target="#result"
+            hx-on::after-request="this.reset()"
+            hx-on::response-error="document.getElementById('result').textContent = 'Upload failed. The server log says why.'">
+        <label class="idle inline-block cursor-pointer rounded-lg bg-white px-8 py-3 font-medium text-neutral-950 transition hover:bg-neutral-200">
+          Upload
+          <input type="file" name="files" accept="application/pdf" multiple class="hidden">
+        </label>
+        <div class="uploading items-center gap-3 text-white">
+          <span class="size-4 animate-spin rounded-full border-2 border-neutral-700 border-t-white"></span>
+          Uploading…
+        </div>
+        <!-- <p id="result" class="mt-6 text-sm text-neutral-400"></p> -->
+      </form>
+      <!-- Old: the contradictions already stored showed when the page opened -->
+      <!-- <div id="result" class="mt-6" hx-get="/contradictions" hx-trigger="load"></div> -->
+      <!-- Empty until an upload finishes; then it shows the contradictions found -->
+      <div id="result" class="mt-6"></div>
+    </main>
+  </body>
+  #}
+  <body class="min-h-screen bg-neutral-950 p-4 text-neutral-300 antialiased">
+    <!-- /upload and /reset replace everything inside #page -->
+    <main id="page" class="mx-auto max-w-6xl py-8">
+      {% include "contradictions.html" %}
+    </main>
   </body>
 </html>

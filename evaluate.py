@@ -74,7 +74,8 @@ def empty_database():
 def upload():
     files = [("files", (pdf.name, pdf.read_bytes(), "application/pdf")) for pdf in sorted(DATA_DIR.glob("*.pdf"))]
     with TestClient(main.app) as client:  # "with" runs the app's startup: create tables, warm up
-        print(client.post("/upload", files=files).text)
+        # print(client.post("/upload", files=files).text)  # /upload now sends back the whole results page
+        print(f"upload: HTTP {client.post('/upload', files=files).status_code}")
 
 
 async def scan():
